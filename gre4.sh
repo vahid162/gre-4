@@ -194,7 +194,7 @@ setup_iran_nat() {
   fi
 
   # MASQUERADE only toward GRE and only to kharej tunnel IP
-  ipt_del_all nat POSTROUTING -j MASQUERADE
+  # Do NOT wipe global MASQUERADE rules; only enforce our specific rule.
   ipt_add nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
 
   # Ensure FORWARD allows the DNATed traffic (safer if policies change)
@@ -256,10 +256,10 @@ ufw_allow_gre_proto47() {
   mv "${before}.tmp" "$before"
 }
 
-ufw_delete_public_port_rules() {
-  # delete any numbered rule containing "<port>/tcp" (v4 & v6)
-  local port="$1"
-  mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/tcp\\b.*/\\1/p" | sort -rn)
+ufw_delete_public_port_proto_rules() {
+  # delete any numbered public rule containing "<port>/<proto>" (v4 & v6)
+  local port="$1" proto="$2"
+  mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/${proto}\\b.*/\\1/p" | sort -rn)
   for n in "${nums[@]}"; do
     yes | ufw delete "$n" >/dev/null
   done
@@ -275,7 +275,8 @@ setup_kharej_ufw() {
   ufw_allow_gre_proto47
 
   # 2) Remove public allow for service port (if any)
-  ufw_delete_public_port_rules "$SERVICE_PORT"
+  ufw_delete_public_port_proto_rules "$SERVICE_PORT" tcp
+  ufw_delete_public_port_proto_rules "$SERVICE_PORT" udp
 
   # 3) Allow service port ONLY from Iran tunnel IP over GRE interface
   ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$SERVICE_PORT" proto tcp >/dev/null
