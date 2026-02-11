@@ -18,7 +18,7 @@ err()  { echo -e "\e[1;31m[-]\e[0m $*" >&2; }
 
 need_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "این اسکریپت باید با root اجرا شود. مثال: sudo bash gre4.sh"
+    err "This script must be run as root. Example: sudo bash gre4.sh"
     exit 1
   fi
 }
@@ -40,6 +40,32 @@ validate_port() {
   return 0
 }
 
+
+normalize_ports_list() {
+  local raw="$1"
+  local cleaned token
+  cleaned=$(echo "$raw" | tr ' ' ',' | tr -s ',')
+  cleaned="${cleaned#,}"
+  cleaned="${cleaned%,}"
+
+  [[ -n "$cleaned" ]] || return 1
+
+  local -A seen=()
+  local out=()
+  IFS=',' read -r -a tokens <<<"$cleaned"
+  for token in "${tokens[@]}"; do
+    [[ -n "$token" ]] || continue
+    validate_port "$token" || return 1
+    if [[ -z "${seen[$token]:-}" ]]; then
+      out+=("$token")
+      seen[$token]=1
+    fi
+  done
+
+  [[ ${#out[@]} -gt 0 ]] || return 1
+  (IFS=','; echo "${out[*]}")
+}
+
 prompt_default() {
   local prompt="$1" default="$2" var
   read -r -p "$prompt [$default]: " var || true
@@ -53,18 +79,18 @@ prompt_default() {
 ensure_cmd() {
   local c="$1"
   command -v "$c" >/dev/null 2>&1 || {
-    err "نیاز به دستور '$c' دارم ولی پیدا نشد."
+    err "Required command '$c' was not found."
     exit 1
   }
 }
 
 write_conf() {
-  local role="$1" local_pub="$2" peer_pub="$3" port="$4" allow_udp="$5"
+  local role="$1" local_pub="$2" peer_pub="$3" ports="$4" allow_udp="$5"
   cat > "$CONF_FILE" <<EOF
 ROLE="$role"
 LOCAL_PUBLIC_IP="$local_pub"
 PEER_PUBLIC_IP="$peer_pub"
-SERVICE_PORT="$port"
+SERVICE_PORTS="$ports"
 ALLOW_UDP="$allow_udp"
 TUN_IF="$TUN_IF"
 IRAN_TUN_CIDR="$IRAN_TUN_CIDR"
@@ -83,6 +109,10 @@ CONF_FILE="/etc/gre4.conf"
 [[ -f "$CONF_FILE" ]] || { echo "Missing $CONF_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF_FILE"
+
+# Backward compatibility with old config key
+SERVICE_PORTS="${SERVICE_PORTS:-${SERVICE_PORT:-}}"
+[[ -n "${SERVICE_PORTS:-}" ]] || { echo "Missing SERVICE_PORTS in $CONF_FILE"; exit 1; }
 
 log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
@@ -132,7 +162,7 @@ tune_conntrack_if_kharej() {
   mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   mem_mb=$((mem_kb/1024))
 
-  # محافظه‌کارانه برای RAM کم (مثل 1GB)
+  # Conservative values for low RAM (e.g. 1GB)
   if [[ "$mem_mb" -ge 2048 ]]; then
     target=262144
   elif [[ "$mem_mb" -ge 1024 ]]; then
@@ -184,27 +214,35 @@ setup_iran_nat() {
   ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
 
   # Remove old per-port rules to avoid duplicates
-  ipt_del_all nat PREROUTING -p tcp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
-  ipt_del_all nat PREROUTING -p udp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
+  local p
+  IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
+  for p in "${ports[@]}"; do
+    ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+    ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+  done
 
-  # Add only selected port
-  ipt_add nat PREROUTING -p tcp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
-  if [[ "$ALLOW_UDP" == "yes" ]]; then
-    ipt_add nat PREROUTING -p udp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
-  fi
+  # Add selected port(s)
+  for p in "${ports[@]}"; do
+    ipt_add nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+    if [[ "$ALLOW_UDP" == "yes" ]]; then
+      ipt_add nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+    fi
+  done
 
   # MASQUERADE only toward GRE and only to kharej tunnel IP
-  ipt_del_all nat POSTROUTING -j MASQUERADE
+  # Do NOT wipe global MASQUERADE rules; only enforce our specific rule.
   ipt_add nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
 
   # Ensure FORWARD allows the DNATed traffic (safer if policies change)
   ipt_add filter FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-  ipt_add filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$SERVICE_PORT" -j ACCEPT
-  if [[ "$ALLOW_UDP" == "yes" ]]; then
-    ipt_add filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$SERVICE_PORT" -j ACCEPT
-  fi
+  for p in "${ports[@]}"; do
+    ipt_add filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
+    if [[ "$ALLOW_UDP" == "yes" ]]; then
+      ipt_add filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
+    fi
+  done
 
-  log "Iran NAT: DNAT فقط پورت $SERVICE_PORT -> 172.16.1.2:$SERVICE_PORT"
+  log "Iran NAT: DNAT selected port(s) $SERVICE_PORTS -> 172.16.1.2:(same ports)"
 }
 
 ufw_is_active() {
@@ -256,10 +294,10 @@ ufw_allow_gre_proto47() {
   mv "${before}.tmp" "$before"
 }
 
-ufw_delete_public_port_rules() {
-  # delete any numbered rule containing "<port>/tcp" (v4 & v6)
-  local port="$1"
-  mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/tcp\\b.*/\\1/p" | sort -rn)
+ufw_delete_public_port_proto_rules() {
+  # delete any numbered public rule containing "<port>/<proto>" (v4 & v6)
+  local port="$1" proto="$2"
+  mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/${proto}\\b.*/\\1/p" | sort -rn)
   for n in "${nums[@]}"; do
     yes | ufw delete "$n" >/dev/null
   done
@@ -269,19 +307,26 @@ setup_kharej_ufw() {
   [[ "$ROLE" == "kharej" ]] || return 0
   ufw_is_active || return 0
 
-  log "UFW active: hardening rules for GRE + port $SERVICE_PORT"
+  log "UFW active: hardening rules for GRE + port(s) $SERVICE_PORTS"
 
   # 1) Ensure GRE proto47 allowed only from peer public IP
   ufw_allow_gre_proto47
 
-  # 2) Remove public allow for service port (if any)
-  ufw_delete_public_port_rules "$SERVICE_PORT"
+  # 2) Remove public allow for service port(s) (if any)
+  local p
+  IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
+  for p in "${ports[@]}"; do
+    ufw_delete_public_port_proto_rules "$p" tcp
+    ufw_delete_public_port_proto_rules "$p" udp
+  done
 
-  # 3) Allow service port ONLY from Iran tunnel IP over GRE interface
-  ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$SERVICE_PORT" proto tcp >/dev/null
-  if [[ "$ALLOW_UDP" == "yes" ]]; then
-    ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$SERVICE_PORT" proto udp >/dev/null
-  fi
+  # 3) Allow service port(s) ONLY from Iran tunnel IP over GRE interface
+  for p in "${ports[@]}"; do
+    ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto tcp >/dev/null
+    if [[ "$ALLOW_UDP" == "yes" ]]; then
+      ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto udp >/dev/null
+    fi
+  done
 
   ufw reload >/dev/null || true
   log "UFW updated (port only over GRE)."
@@ -306,8 +351,12 @@ stop_all() {
   if command -v iptables >/dev/null 2>&1; then
     ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
     ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
-    ipt_del_all nat PREROUTING -p tcp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
-    ipt_del_all nat PREROUTING -p udp --dport "$SERVICE_PORT" -j DNAT --to-destination "172.16.1.2:${SERVICE_PORT}"
+    local p
+    IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
+    for p in "${ports[@]}"; do
+      ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+      ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+    done
     ipt_del_all nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
   fi
 
@@ -361,10 +410,10 @@ remove_everything() {
 }
 
 main_menu() {
-  echo "انتخاب کن:"
-  echo "1) راه‌اندازی ایران (Gateway + DNAT فقط یک پورت)"
-  echo "2) راه‌اندازی خارج (Server + UFW hardening + conntrack tune)"
-  echo "3) حذف کامل (Remove)"
+  echo "Choose an option:"
+  echo "1) Setup Iran (Gateway + DNAT for one or more ports)"
+  echo "2) Setup Kharej (Server + UFW hardening + conntrack tuning)"
+  echo "3) Remove everything"
   echo
 }
 
@@ -379,43 +428,43 @@ main() {
 
   case "$choice" in
     1)
-      local iran_ip kharej_ip port allow_udp
-      iran_ip=$(prompt_default "IP عمومی ایران" "")
-      validate_ipv4 "$iran_ip" || { err "IP ایران نامعتبر است."; exit 1; }
-      kharej_ip=$(prompt_default "IP عمومی خارج" "")
-      validate_ipv4 "$kharej_ip" || { err "IP خارج نامعتبر است."; exit 1; }
+      local iran_ip kharej_ip ports allow_udp
+      iran_ip=$(prompt_default "Iran public IP" "")
+      validate_ipv4 "$iran_ip" || { err "Invalid Iran IP."; exit 1; }
+      kharej_ip=$(prompt_default "Kharej public IP" "")
+      validate_ipv4 "$kharej_ip" || { err "Invalid Kharej IP."; exit 1; }
 
-      port=$(prompt_default "پورت سرویس (مثلاً 2096)" "2096")
-      validate_port "$port" || { err "پورت نامعتبر است."; exit 1; }
+      ports=$(prompt_default "Service port(s), comma-separated (e.g. 2096 or 80,443)" "2096")
+      ports=$(normalize_ports_list "$ports") || { err "Invalid port list."; exit 1; }
 
-      allow_udp=$(prompt_default "UDP هم فوروارد شود؟ (yes/no)" "no")
+      allow_udp=$(prompt_default "Forward UDP as well? (yes/no)" "no")
       if [[ "$allow_udp" != "yes" && "$allow_udp" != "no" ]]; then
-        err "فقط yes یا no"
+        err "Only yes or no is allowed"
         exit 1
       fi
 
-      write_conf "iran" "$iran_ip" "$kharej_ip" "$port" "$allow_udp"
+      write_conf "iran" "$iran_ip" "$kharej_ip" "$ports" "$allow_udp"
       install_apply_script
       install_systemd_unit
       log "Iran configured. Test: ip a show $TUN_IF ; iptables -t nat -S"
       ;;
     2)
-      local kharej_ip iran_ip port allow_udp
-      kharej_ip=$(prompt_default "IP عمومی خارج" "")
-      validate_ipv4 "$kharej_ip" || { err "IP خارج نامعتبر است."; exit 1; }
-      iran_ip=$(prompt_default "IP عمومی ایران" "")
-      validate_ipv4 "$iran_ip" || { err "IP ایران نامعتبر است."; exit 1; }
+      local kharej_ip iran_ip ports allow_udp
+      kharej_ip=$(prompt_default "Kharej public IP" "")
+      validate_ipv4 "$kharej_ip" || { err "Invalid Kharej IP."; exit 1; }
+      iran_ip=$(prompt_default "Iran public IP" "")
+      validate_ipv4 "$iran_ip" || { err "Invalid Iran IP."; exit 1; }
 
-      port=$(prompt_default "پورت سرویس (مثلاً 2096)" "2096")
-      validate_port "$port" || { err "پورت نامعتبر است."; exit 1; }
+      ports=$(prompt_default "Service port(s), comma-separated (e.g. 2096 or 80,443)" "2096")
+      ports=$(normalize_ports_list "$ports") || { err "Invalid port list."; exit 1; }
 
-      allow_udp=$(prompt_default "UDP هم اجازه داده شود؟ (yes/no)" "no")
+      allow_udp=$(prompt_default "Allow UDP too? (yes/no)" "no")
       if [[ "$allow_udp" != "yes" && "$allow_udp" != "no" ]]; then
-        err "فقط yes یا no"
+        err "Only yes or no is allowed"
         exit 1
       fi
 
-      write_conf "kharej" "$kharej_ip" "$iran_ip" "$port" "$allow_udp"
+      write_conf "kharej" "$kharej_ip" "$iran_ip" "$ports" "$allow_udp"
       install_apply_script
       install_systemd_unit
       log "Kharej configured. Test: ip a show $TUN_IF ; ufw status verbose (if active)"
@@ -424,7 +473,7 @@ main() {
       remove_everything
       ;;
     *)
-      err "گزینه نامعتبر."
+      err "Invalid option."
       exit 1
       ;;
   esac
