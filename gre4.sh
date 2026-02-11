@@ -76,6 +76,156 @@ prompt_default() {
   fi
 }
 
+load_current_conf() {
+  [[ -f "$CONF_FILE" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+  SERVICE_PORTS="${SERVICE_PORTS:-${SERVICE_PORT:-}}"
+  [[ -n "${SERVICE_PORTS:-}" ]] || return 1
+  return 0
+}
+
+service_installed() {
+  [[ -f "$UNIT_FILE" && -f "$APPLY_SCRIPT" ]]
+}
+
+show_current_settings() {
+  if ! load_current_conf; then
+    warn "No valid config found at $CONF_FILE"
+    return 1
+  fi
+
+  echo
+  echo "Current settings:"
+  echo "  ROLE=$ROLE"
+  echo "  LOCAL_PUBLIC_IP=$LOCAL_PUBLIC_IP"
+  echo "  PEER_PUBLIC_IP=$PEER_PUBLIC_IP"
+  echo "  SERVICE_PORTS=$SERVICE_PORTS"
+  echo "  ALLOW_UDP=$ALLOW_UDP"
+  echo
+}
+
+restart_service() {
+  systemctl daemon-reload
+  systemctl restart gre4.service
+  log "Service restarted: gre4.service"
+}
+
+show_status() {
+  if load_current_conf; then
+    show_current_settings || true
+  else
+    warn "Config not found or invalid: $CONF_FILE"
+  fi
+
+  echo "Service status:"
+  systemctl --no-pager --full status gre4.service 2>/dev/null || warn "gre4.service not installed/active"
+
+  echo
+  echo "Tunnel status:"
+  ip a show "$TUN_IF" 2>/dev/null || warn "Tunnel interface $TUN_IF not found"
+}
+
+manage_ports_add() {
+  load_current_conf || { err "Cannot load current config."; return 1; }
+  local add normalized merged
+  add=$(prompt_default "Ports to add (comma-separated)" "")
+  normalized=$(normalize_ports_list "$add") || { err "Invalid port list."; return 1; }
+  merged=$(normalize_ports_list "${SERVICE_PORTS},${normalized}") || { err "Failed to merge ports."; return 1; }
+  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$merged" "$ALLOW_UDP"
+  restart_service
+}
+
+manage_ports_remove() {
+  load_current_conf || { err "Cannot load current config."; return 1; }
+  local remove normalized p result=""
+  remove=$(prompt_default "Ports to remove (comma-separated)" "")
+  normalized=$(normalize_ports_list "$remove") || { err "Invalid port list."; return 1; }
+
+  local -A rm=()
+  IFS=',' read -r -a to_remove <<<"$normalized"
+  for p in "${to_remove[@]}"; do rm["$p"]=1; done
+
+  IFS=',' read -r -a current <<<"$SERVICE_PORTS"
+  for p in "${current[@]}"; do
+    if [[ -z "${rm[$p]:-}" ]]; then
+      if [[ -z "$result" ]]; then result="$p"; else result="$result,$p"; fi
+    fi
+  done
+
+  result="${result#,}"
+  if [[ -z "$result" ]]; then
+    err "Cannot remove all ports. At least one port must remain."
+    return 1
+  fi
+
+  result=$(normalize_ports_list "$result") || { err "Resulting port list is invalid."; return 1; }
+  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$result" "$ALLOW_UDP"
+  restart_service
+}
+
+manage_replace_ports() {
+  load_current_conf || { err "Cannot load current config."; return 1; }
+  local ports
+  ports=$(prompt_default "New service port(s), comma-separated" "$SERVICE_PORTS")
+  ports=$(normalize_ports_list "$ports") || { err "Invalid port list."; return 1; }
+  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$ports" "$ALLOW_UDP"
+  restart_service
+}
+
+manage_change_ips() {
+  load_current_conf || { err "Cannot load current config."; return 1; }
+  local local_ip peer_ip
+  local_ip=$(prompt_default "Local public IP" "$LOCAL_PUBLIC_IP")
+  validate_ipv4 "$local_ip" || { err "Invalid local public IP."; return 1; }
+  peer_ip=$(prompt_default "Peer public IP" "$PEER_PUBLIC_IP")
+  validate_ipv4 "$peer_ip" || { err "Invalid peer public IP."; return 1; }
+  write_conf "$ROLE" "$local_ip" "$peer_ip" "$SERVICE_PORTS" "$ALLOW_UDP"
+  restart_service
+}
+
+manage_toggle_udp() {
+  load_current_conf || { err "Cannot load current config."; return 1; }
+  local udp
+  udp=$(prompt_default "ALLOW_UDP (yes/no)" "$ALLOW_UDP")
+  [[ "$udp" == "yes" || "$udp" == "no" ]] || { err "Only yes or no is allowed"; return 1; }
+  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$udp"
+  restart_service
+}
+
+manage_menu() {
+  service_installed || { err "gre4 is not installed yet."; return 1; }
+
+  while true; do
+    echo
+    echo "Manage menu:"
+    echo "1) Show current settings"
+    echo "2) Add port(s)"
+    echo "3) Remove port(s)"
+    echo "4) Replace all ports"
+    echo "5) Change local/peer IPs"
+    echo "6) Toggle UDP (yes/no)"
+    echo "7) Apply now (restart service)"
+    echo "8) Status"
+    echo "9) Back"
+    echo
+    local c
+    read -r -p "Enter choice (1-9): " c
+    case "$c" in
+      1) show_current_settings ;;
+      2) manage_ports_add ;;
+      3) manage_ports_remove ;;
+      4) manage_replace_ports ;;
+      5) manage_change_ips ;;
+      6) manage_toggle_udp ;;
+      7) restart_service ;;
+      8) show_status ;;
+      9) break ;;
+      *) err "Invalid option." ;;
+    esac
+  done
+}
+
 ensure_cmd() {
   local c="$1"
   command -v "$c" >/dev/null 2>&1 || {
@@ -234,7 +384,7 @@ setup_iran_nat() {
   ipt_add nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
 
   # Ensure FORWARD allows the DNATed traffic (safer if policies change)
-  ipt_add filter FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  ipt_add filter FORWARD -i "$TUN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   for p in "${ports[@]}"; do
     ipt_add filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
     if [[ "$ALLOW_UDP" == "yes" ]]; then
@@ -294,6 +444,23 @@ ufw_allow_gre_proto47() {
   mv "${before}.tmp" "$before"
 }
 
+ufw_remove_gre_proto47_block() {
+  local before="/etc/ufw/before.rules"
+  [[ -f "$before" ]] || return 0
+
+  local begin="# gre4.sh BEGIN"
+  local end="# gre4.sh END"
+
+  if grep -qF "$begin" "$before"; then
+    awk -v b="$begin" -v e="$end" '
+      $0==b{skip=1;next}
+      $0==e{skip=0;next}
+      !skip{print}
+    ' "$before" > "${before}.tmp"
+    mv "${before}.tmp" "$before"
+  fi
+}
+
 ufw_delete_public_port_proto_rules() {
   # delete any numbered public rule containing "<port>/<proto>" (v4 & v6)
   local port="$1" proto="$2"
@@ -347,17 +514,31 @@ stop_all() {
     ip tunnel del "$TUN_IF" 2>/dev/null || true
   fi
 
+  local p
+  IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
+
   # Remove Iran rules if exist (best-effort)
   if command -v iptables >/dev/null 2>&1; then
     ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
     ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
-    local p
-    IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
     for p in "${ports[@]}"; do
       ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
       ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
+      ipt_del_all filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
+      ipt_del_all filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
     done
     ipt_del_all nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
+    ipt_del_all filter FORWARD -i "$TUN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  fi
+
+  # Remove kharej UFW rules if active
+  if ufw_is_active; then
+    for p in "${ports[@]}"; do
+      ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto tcp >/dev/null 2>&1 || true
+      ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto udp >/dev/null 2>&1 || true
+    done
+    ufw_remove_gre_proto47_block
+    ufw reload >/dev/null 2>&1 || true
   fi
 
   log "Stop done."
@@ -398,6 +579,12 @@ EOF
 
 remove_everything() {
   warn "Removing GRE4 (service + tunnel + rules)..."
+
+  # best-effort cleanup first
+  if [[ -x "$APPLY_SCRIPT" && -f "$CONF_FILE" ]]; then
+    "$APPLY_SCRIPT" stop || true
+  fi
+
   systemctl disable --now gre4.service >/dev/null 2>&1 || true
   rm -f "$UNIT_FILE" "$APPLY_SCRIPT" "$CONF_FILE"
   systemctl daemon-reload || true
@@ -414,6 +601,8 @@ main_menu() {
   echo "1) Setup Iran (Gateway + DNAT for one or more ports)"
   echo "2) Setup Kharej (Server + UFW hardening + conntrack tuning)"
   echo "3) Remove everything"
+  echo "4) Manage existing deployment"
+  echo "5) Status"
   echo
 }
 
@@ -424,7 +613,7 @@ main() {
 
   main_menu
   local choice
-  read -r -p "Enter choice (1/2/3): " choice
+  read -r -p "Enter choice (1/2/3/4/5): " choice
 
   case "$choice" in
     1)
@@ -471,6 +660,12 @@ main() {
       ;;
     3)
       remove_everything
+      ;;
+    4)
+      manage_menu
+      ;;
+    5)
+      show_status
       ;;
     *)
       err "Invalid option."
