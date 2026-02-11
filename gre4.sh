@@ -18,7 +18,7 @@ err()  { echo -e "\e[1;31m[-]\e[0m $*" >&2; }
 
 need_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "این اسکریپت باید با root اجرا شود. مثال: sudo bash gre4.sh"
+    err "This script must be run as root. Example: sudo bash gre4.sh"
     exit 1
   fi
 }
@@ -53,7 +53,7 @@ prompt_default() {
 ensure_cmd() {
   local c="$1"
   command -v "$c" >/dev/null 2>&1 || {
-    err "نیاز به دستور '$c' دارم ولی پیدا نشد."
+    err "Required command '$c' was not found."
     exit 1
   }
 }
@@ -132,7 +132,7 @@ tune_conntrack_if_kharej() {
   mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   mem_mb=$((mem_kb/1024))
 
-  # محافظه‌کارانه برای RAM کم (مثل 1GB)
+  # Conservative values for low RAM (e.g. 1GB)
   if [[ "$mem_mb" -ge 2048 ]]; then
     target=262144
   elif [[ "$mem_mb" -ge 1024 ]]; then
@@ -204,7 +204,7 @@ setup_iran_nat() {
     ipt_add filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$SERVICE_PORT" -j ACCEPT
   fi
 
-  log "Iran NAT: DNAT فقط پورت $SERVICE_PORT -> 172.16.1.2:$SERVICE_PORT"
+  log "Iran NAT: DNAT only port $SERVICE_PORT -> 172.16.1.2:$SERVICE_PORT"
 }
 
 ufw_is_active() {
@@ -362,10 +362,10 @@ remove_everything() {
 }
 
 main_menu() {
-  echo "انتخاب کن:"
-  echo "1) راه‌اندازی ایران (Gateway + DNAT فقط یک پورت)"
-  echo "2) راه‌اندازی خارج (Server + UFW hardening + conntrack tune)"
-  echo "3) حذف کامل (Remove)"
+  echo "Choose an option:"
+  echo "1) Setup Iran (Gateway + DNAT for a single port only)"
+  echo "2) Setup Kharej (Server + UFW hardening + conntrack tuning)"
+  echo "3) Remove everything"
   echo
 }
 
@@ -381,17 +381,17 @@ main() {
   case "$choice" in
     1)
       local iran_ip kharej_ip port allow_udp
-      iran_ip=$(prompt_default "IP عمومی ایران" "")
-      validate_ipv4 "$iran_ip" || { err "IP ایران نامعتبر است."; exit 1; }
-      kharej_ip=$(prompt_default "IP عمومی خارج" "")
-      validate_ipv4 "$kharej_ip" || { err "IP خارج نامعتبر است."; exit 1; }
+      iran_ip=$(prompt_default "Iran public IP" "")
+      validate_ipv4 "$iran_ip" || { err "Invalid Iran IP."; exit 1; }
+      kharej_ip=$(prompt_default "Kharej public IP" "")
+      validate_ipv4 "$kharej_ip" || { err "Invalid Kharej IP."; exit 1; }
 
-      port=$(prompt_default "پورت سرویس (مثلاً 2096)" "2096")
-      validate_port "$port" || { err "پورت نامعتبر است."; exit 1; }
+      port=$(prompt_default "Service port (e.g. 2096)" "2096")
+      validate_port "$port" || { err "Invalid port."; exit 1; }
 
-      allow_udp=$(prompt_default "UDP هم فوروارد شود؟ (yes/no)" "no")
+      allow_udp=$(prompt_default "Forward UDP as well? (yes/no)" "no")
       if [[ "$allow_udp" != "yes" && "$allow_udp" != "no" ]]; then
-        err "فقط yes یا no"
+        err "Only yes or no is allowed"
         exit 1
       fi
 
@@ -402,17 +402,17 @@ main() {
       ;;
     2)
       local kharej_ip iran_ip port allow_udp
-      kharej_ip=$(prompt_default "IP عمومی خارج" "")
-      validate_ipv4 "$kharej_ip" || { err "IP خارج نامعتبر است."; exit 1; }
-      iran_ip=$(prompt_default "IP عمومی ایران" "")
-      validate_ipv4 "$iran_ip" || { err "IP ایران نامعتبر است."; exit 1; }
+      kharej_ip=$(prompt_default "Kharej public IP" "")
+      validate_ipv4 "$kharej_ip" || { err "Invalid Kharej IP."; exit 1; }
+      iran_ip=$(prompt_default "Iran public IP" "")
+      validate_ipv4 "$iran_ip" || { err "Invalid Iran IP."; exit 1; }
 
-      port=$(prompt_default "پورت سرویس (مثلاً 2096)" "2096")
-      validate_port "$port" || { err "پورت نامعتبر است."; exit 1; }
+      port=$(prompt_default "Service port (e.g. 2096)" "2096")
+      validate_port "$port" || { err "Invalid port."; exit 1; }
 
-      allow_udp=$(prompt_default "UDP هم اجازه داده شود؟ (yes/no)" "no")
+      allow_udp=$(prompt_default "Allow UDP too? (yes/no)" "no")
       if [[ "$allow_udp" != "yes" && "$allow_udp" != "no" ]]; then
-        err "فقط yes یا no"
+        err "Only yes or no is allowed"
         exit 1
       fi
 
@@ -425,7 +425,7 @@ main() {
       remove_everything
       ;;
     *)
-      err "گزینه نامعتبر."
+      err "Invalid option."
       exit 1
       ;;
   esac
