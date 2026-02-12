@@ -3,7 +3,7 @@ set -euo pipefail
 
 # gre4.sh - GRE tunnel + (Iran: DNAT only one port) + (Kharej: UFW restrict + conntrack tune)
 # Repo: https://github.com/vahid162/gre-4
-# Author: vahid162 (modified with hardening + port prompt)
+# Author: vahid162 (modified with manage menu + port prompt)
 
 TUN_IF="GRE"
 IRAN_TUN_CIDR="172.16.1.1/30"
@@ -472,43 +472,41 @@ ufw_remove_gre_proto47_block() {
   mv "${before}.tmp" "$before"
 }
 
-ufw_delete_public_port_proto_rules() {
-  # delete any numbered public rule containing "<port>/<proto>" (v4 & v6)
-  local port="$1" proto="$2"
-  mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/${proto}\\b.*/\\1/p" | sort -rn)
+ufw_delete_managed_rules() {
+  # delete numbered rules created by this script (tagged by comment)
+  local tag="gre4-managed"
+  mapfile -t nums < <(ufw status numbered | sed -n "s/^\[\s*\([0-9]\+\)\].*${tag}.*/\1/p" | sort -rn)
   for n in "${nums[@]}"; do
     ufw --force delete "$n" >/dev/null
   done
 }
 
+
 setup_kharej_ufw() {
   [[ "$ROLE" == "kharej" ]] || return 0
   ufw_is_active || return 0
 
-  log "UFW active: hardening rules for GRE + port(s) $SERVICE_PORTS"
+  log "UFW active: enabling public access for port(s) $SERVICE_PORTS"
 
   # 1) Ensure GRE proto47 allowed only from peer public IP
   ufw_allow_gre_proto47
 
-  # 2) Remove public allow for service port(s) (if any)
+  # 2) Remove old gre4-managed rules to avoid duplicates
+  ufw_delete_managed_rules
+
+  # 3) Allow service port(s) publicly (all interfaces, including enp1s0 and GRE)
   local p
   IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
   for p in "${ports[@]}"; do
-    ufw_delete_public_port_proto_rules "$p" tcp
-    ufw_delete_public_port_proto_rules "$p" udp
-  done
-
-  # 3) Allow service port(s) ONLY from Iran tunnel IP over GRE interface
-  for p in "${ports[@]}"; do
-    ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto tcp >/dev/null
+    ufw allow "$p/tcp" comment 'gre4-managed' >/dev/null
     if [[ "$ALLOW_UDP" == "yes" ]]; then
-      ufw allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto udp >/dev/null
+      ufw allow "$p/udp" comment 'gre4-managed' >/dev/null
     fi
   done
 
   ufw_before_rules_test "/etc/ufw/before.rules"
   ufw reload >/dev/null || true
-  log "UFW updated (port only over GRE)."
+  log "UFW updated (public port access enabled)."
 }
 
 start_all() {
@@ -545,10 +543,7 @@ stop_all() {
 
   # Remove kharej UFW rules if active
   if ufw_is_active; then
-    for p in "${ports[@]}"; do
-      ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto tcp >/dev/null 2>&1 || true
-      ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto udp >/dev/null 2>&1 || true
-    done
+    ufw_delete_managed_rules || true
     ufw_remove_gre_proto47_block || true
     ufw_before_rules_test "/etc/ufw/before.rules" || true
     ufw reload >/dev/null 2>&1 || true
@@ -612,7 +607,7 @@ remove_everything() {
 main_menu() {
   echo "Choose an option:"
   echo "1) Setup Iran (Gateway + DNAT for one or more ports)"
-  echo "2) Setup Kharej (Server + UFW hardening + conntrack tuning)"
+  echo "2) Setup Kharej (Server + UFW public access + conntrack tuning)"
   echo "3) Remove everything"
   echo "4) Manage existing deployment"
   echo "5) Status"
