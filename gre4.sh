@@ -400,9 +400,14 @@ ufw_is_active() {
   ufw status 2>/dev/null | head -n1 | grep -qi "Status: active"
 }
 
+ufw_before_rules_test() {
+  local file="$1"
+  command -v iptables-restore >/dev/null 2>&1 || return 0
+  iptables-restore --test < "$file"
+}
+
 ufw_allow_gre_proto47() {
-  # UFW doesn't have a simple "port" for GRE; safest is to add protocol 47 rules in before.rules with src/dst restriction
-  # Ref: AskUbuntu method (proto 47 in ufw-before-input/output) with source restriction. (We do it automatically.)
+  # UFW before.rules uses iptables-restore format; rules must be inserted inside *filter table before its COMMIT.
   local before="/etc/ufw/before.rules"
   [[ -f "$before" ]] || return 0
 
@@ -411,37 +416,38 @@ ufw_allow_gre_proto47() {
   local rule_in="-A ufw-before-input -p 47 -s ${PEER_PUBLIC_IP} -d ${LOCAL_PUBLIC_IP} -j ACCEPT"
   local rule_out="-A ufw-before-output -p 47 -s ${LOCAL_PUBLIC_IP} -d ${PEER_PUBLIC_IP} -j ACCEPT"
 
-  # Remove old block if exists
-  if grep -qF "$begin" "$before"; then
-    awk -v b="$begin" -v e="$end" '
-      $0==b{skip=1;next}
-      $0==e{skip=0;next}
-      !skip{print}
-    ' "$before" > "${before}.tmp"
-    mv "${before}.tmp" "$before"
+  awk -v b="$begin" -v e="$end" '
+    $0==b{skip=1;next}
+    $0==e{skip=0;next}
+    !skip{print}
+  ' "$before" > "${before}.tmp.clean"
+
+  awk -v b="$begin" -v e="$end" -v rin="$rule_in" -v rout="$rule_out" '
+    {
+      if($0=="*filter"){ in_filter=1 }
+      if(in_filter && $0=="COMMIT" && !inserted){
+        print b
+        print rin
+        print rout
+        print e
+        inserted=1
+      }
+      print
+      if(in_filter && $0=="COMMIT"){ in_filter=0 }
+    }
+    END {
+      if(!inserted) exit 42
+    }
+  ' "${before}.tmp.clean" > "${before}.tmp"
+
+  if ! ufw_before_rules_test "${before}.tmp"; then
+    rm -f "${before}.tmp.clean" "${before}.tmp"
+    err "Invalid $before after GRE block insert; aborting UFW update."
+    return 1
   fi
 
-  # Insert block before final COMMIT of filter table (best-effort: before last line "COMMIT")
-  awk -v b="$begin" -v e="$end" -v rin="$rule_in" -v rout="$rule_out" '
-    { lines[NR]=$0 }
-    END {
-      # find last COMMIT
-      c=0
-      for(i=NR;i>=1;i--) if(lines[i]=="COMMIT"){ c=i; break }
-      if(c==0){
-        for(i=1;i<=NR;i++) print lines[i]
-        exit
-      }
-      for(i=1;i<c;i++) print lines[i]
-      print b
-      print rin
-      print rout
-      print e
-      print "COMMIT"
-      for(i=c+1;i<=NR;i++) print lines[i]
-    }
-  ' "$before" > "${before}.tmp"
   mv "${before}.tmp" "$before"
+  rm -f "${before}.tmp.clean"
 }
 
 ufw_remove_gre_proto47_block() {
@@ -451,14 +457,19 @@ ufw_remove_gre_proto47_block() {
   local begin="# gre4.sh BEGIN"
   local end="# gre4.sh END"
 
-  if grep -qF "$begin" "$before"; then
-    awk -v b="$begin" -v e="$end" '
-      $0==b{skip=1;next}
-      $0==e{skip=0;next}
-      !skip{print}
-    ' "$before" > "${before}.tmp"
-    mv "${before}.tmp" "$before"
+  awk -v b="$begin" -v e="$end" '
+    $0==b{skip=1;next}
+    $0==e{skip=0;next}
+    !skip{print}
+  ' "$before" > "${before}.tmp"
+
+  if ! ufw_before_rules_test "${before}.tmp"; then
+    rm -f "${before}.tmp"
+    err "Invalid $before after GRE block removal; keeping original file."
+    return 1
   fi
+
+  mv "${before}.tmp" "$before"
 }
 
 ufw_delete_public_port_proto_rules() {
@@ -466,7 +477,7 @@ ufw_delete_public_port_proto_rules() {
   local port="$1" proto="$2"
   mapfile -t nums < <(ufw status numbered | sed -n "s/^\\[\\s*\\([0-9]\\+\\)\\].*\\b${port}\\/${proto}\\b.*/\\1/p" | sort -rn)
   for n in "${nums[@]}"; do
-    yes | ufw delete "$n" >/dev/null
+    ufw --force delete "$n" >/dev/null
   done
 }
 
@@ -495,6 +506,7 @@ setup_kharej_ufw() {
     fi
   done
 
+  ufw_before_rules_test "/etc/ufw/before.rules"
   ufw reload >/dev/null || true
   log "UFW updated (port only over GRE)."
 }
@@ -537,7 +549,8 @@ stop_all() {
       ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto tcp >/dev/null 2>&1 || true
       ufw delete allow in on "$TUN_IF" from 172.16.1.1 to any port "$p" proto udp >/dev/null 2>&1 || true
     done
-    ufw_remove_gre_proto47_block
+    ufw_remove_gre_proto47_block || true
+    ufw_before_rules_test "/etc/ufw/before.rules" || true
     ufw reload >/dev/null 2>&1 || true
   fi
 
