@@ -481,6 +481,21 @@ ufw_delete_managed_rules() {
   done
 }
 
+ensure_ssh_access_with_ufw() {
+  # Safety net: before removing managed UFW rules, explicitly allow active sshd port(s).
+  # This prevents accidental lockout when SSH port was part of SERVICE_PORTS.
+  command -v sshd >/dev/null 2>&1 || return 0
+
+  local p
+  mapfile -t ssh_ports < <(sshd -T 2>/dev/null | awk '/^port / {print $2}' | sort -u)
+  [[ ${#ssh_ports[@]} -gt 0 ]] || ssh_ports=(22)
+
+  for p in "${ssh_ports[@]}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    ufw allow "$p/tcp" comment 'gre4-ssh-safety' >/dev/null || true
+  done
+}
+
 
 setup_kharej_ufw() {
   [[ "$ROLE" == "kharej" ]] || return 0
@@ -543,6 +558,7 @@ stop_all() {
 
   # Remove kharej UFW rules if active
   if ufw_is_active; then
+    ensure_ssh_access_with_ufw || true
     ufw_delete_managed_rules || true
     ufw_remove_gre_proto47_block || true
     ufw_before_rules_test "/etc/ufw/before.rules" || true
