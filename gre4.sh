@@ -111,6 +111,14 @@ restart_service() {
   log "Service restarted: gre4.service"
 }
 
+update_conf() {
+  # ExecStop must read the configuration that created the current rules.
+  systemctl stop gre4.service || return
+  write_conf "$@" || return
+  systemctl start gre4.service || return
+  log "Configuration applied: gre4.service"
+}
+
 show_status() {
   if load_current_conf; then
     show_current_settings || true
@@ -132,8 +140,7 @@ manage_ports_add() {
   add=$(prompt_default "Ports to add (comma-separated)" "")
   normalized=$(normalize_ports_list "$add") || { err "Invalid port list."; return 1; }
   merged=$(normalize_ports_list "${SERVICE_PORTS},${normalized}") || { err "Failed to merge ports."; return 1; }
-  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$merged" "$ALLOW_UDP"
-  restart_service
+  update_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$merged" "$ALLOW_UDP"
 }
 
 manage_ports_remove() {
@@ -160,8 +167,7 @@ manage_ports_remove() {
   fi
 
   result=$(normalize_ports_list "$result") || { err "Resulting port list is invalid."; return 1; }
-  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$result" "$ALLOW_UDP"
-  restart_service
+  update_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$result" "$ALLOW_UDP"
 }
 
 manage_replace_ports() {
@@ -169,8 +175,7 @@ manage_replace_ports() {
   local ports
   ports=$(prompt_default "New service port(s), comma-separated" "$SERVICE_PORTS")
   ports=$(normalize_ports_list "$ports") || { err "Invalid port list."; return 1; }
-  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$ports" "$ALLOW_UDP"
-  restart_service
+  update_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$ports" "$ALLOW_UDP"
 }
 
 manage_change_ips() {
@@ -180,8 +185,7 @@ manage_change_ips() {
   validate_ipv4 "$local_ip" || { err "Invalid local public IP."; return 1; }
   peer_ip=$(prompt_default "Peer public IP" "$PEER_PUBLIC_IP")
   validate_ipv4 "$peer_ip" || { err "Invalid peer public IP."; return 1; }
-  write_conf "$ROLE" "$local_ip" "$peer_ip" "$SERVICE_PORTS" "$ALLOW_UDP"
-  restart_service
+  update_conf "$ROLE" "$local_ip" "$peer_ip" "$SERVICE_PORTS" "$ALLOW_UDP"
 }
 
 manage_toggle_udp() {
@@ -189,8 +193,7 @@ manage_toggle_udp() {
   local udp
   udp=$(prompt_default "ALLOW_UDP (yes/no)" "$ALLOW_UDP")
   [[ "$udp" == "yes" || "$udp" == "no" ]] || { err "Only yes or no is allowed"; return 1; }
-  write_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$udp"
-  restart_service
+  update_conf "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$udp"
 }
 
 manage_menu() {
@@ -236,7 +239,7 @@ ensure_cmd() {
 
 write_conf() {
   local role="$1" local_pub="$2" peer_pub="$3" ports="$4" allow_udp="$5"
-  cat > "$CONF_FILE" <<EOF
+  cat > "$CONF_FILE" <<EOF || return
 ROLE="$role"
 LOCAL_PUBLIC_IP="$local_pub"
 PEER_PUBLIC_IP="$peer_pub"
@@ -246,12 +249,12 @@ TUN_IF="$TUN_IF"
 IRAN_TUN_CIDR="$IRAN_TUN_CIDR"
 KHAREJ_TUN_CIDR="$KHAREJ_TUN_CIDR"
 EOF
-  chmod 600 "$CONF_FILE"
+  chmod 600 "$CONF_FILE" || return
   log "Config saved to $CONF_FILE"
 }
 
 install_apply_script() {
-  cat > "$APPLY_SCRIPT" <<'EOF'
+  cat > "$APPLY_SCRIPT" <<'EOF' || return
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -473,26 +476,51 @@ ufw_remove_gre_proto47_block() {
 }
 
 ufw_delete_managed_rules() {
-  # delete numbered rules created by this script (tagged by comment)
-  local tag="gre4-managed"
-  mapfile -t nums < <(ufw status numbered | sed -n "s/^\[\s*\([0-9]\+\)\].*${tag}.*/\1/p" | sort -rn)
+  local status ssh_config key p n ssh_ports=""
+  local -a nums=()
+  status=$(ufw status numbered) || return
+  if ! grep -Eq '^\[[[:space:]]*[0-9]+\].*#[[:space:]]*gre4-managed[[:space:]]*$' <<< "$status"; then
+    return 0
+  fi
+  if [[ "${1:-}" == "preserve-ssh" ]] && command -v sshd >/dev/null 2>&1; then
+    # Keep existing SSH allowances unchanged; never create broader access.
+    if ! ssh_config=$(sshd -T 2>/dev/null); then
+      warn "Cannot detect SSH ports; keeping managed UFW rules."
+      return 1
+    fi
+    while read -r key p _; do
+      [[ "$key" == "port" ]] || continue
+      if [[ ! "$p" =~ ^[0-9]{1,5}$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then
+        warn "Invalid SSH port; keeping managed UFW rules."
+        return 1
+      fi
+      ssh_ports+=" $((10#$p))/tcp"
+    done <<< "$ssh_config"
+    if [[ -z "$ssh_ports" ]]; then
+      warn "No SSH ports detected; keeping managed UFW rules."
+      return 1
+    fi
+  fi
+
+  mapfile -t nums < <(awk -v keep="$ssh_ports " '
+    /^\[[[:space:]]*[0-9]+\]/ && /#[[:space:]]*gre4-managed[[:space:]]*$/ {
+      rule=$0
+      sub(/#.*/, "", rule)
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", rule)
+      if (match(rule, /[[:space:]]ALLOW[[:space:]]+IN([[:space:]]|$)/)) {
+        count=split(substr(rule, 1, RSTART-1), fields, /[[:space:]]+/)
+        for (i=1; i<=count; i++) {
+          if (index(keep, " " fields[i] " ")) next
+        }
+      }
+      number=$0
+      sub(/^\[[[:space:]]*/, "", number)
+      sub(/\].*$/, "", number)
+      print number
+    }
+  ' <<< "$status" | sort -rn)
   for n in "${nums[@]}"; do
-    ufw --force delete "$n" >/dev/null
-  done
-}
-
-ensure_ssh_access_with_ufw() {
-  # Safety net: before removing managed UFW rules, explicitly allow active sshd port(s).
-  # This prevents accidental lockout when SSH port was part of SERVICE_PORTS.
-  command -v sshd >/dev/null 2>&1 || return 0
-
-  local p
-  mapfile -t ssh_ports < <(sshd -T 2>/dev/null | awk '/^port / {print $2}' | sort -u)
-  [[ ${#ssh_ports[@]} -gt 0 ]] || ssh_ports=(22)
-
-  for p in "${ssh_ports[@]}"; do
-    [[ "$p" =~ ^[0-9]+$ ]] || continue
-    ufw allow "$p/tcp" comment 'gre4-ssh-safety' >/dev/null || true
+    ufw --force delete "$n" >/dev/null || return
   done
 }
 
@@ -506,8 +534,8 @@ setup_kharej_ufw() {
   # 1) Ensure GRE proto47 allowed only from peer public IP
   ufw_allow_gre_proto47
 
-  # 2) Remove old gre4-managed rules to avoid duplicates
-  ufw_delete_managed_rules
+  # 2) Remove old service rules without revoking existing SSH access.
+  ufw_delete_managed_rules preserve-ssh || return
 
   # 3) Allow service port(s) publicly (all interfaces, including enp1s0 and GRE)
   local p
@@ -520,7 +548,7 @@ setup_kharej_ufw() {
   done
 
   ufw_before_rules_test "/etc/ufw/before.rules"
-  ufw reload >/dev/null || true
+  ufw reload >/dev/null || return
   log "UFW updated (public port access enabled)."
 }
 
@@ -558,8 +586,7 @@ stop_all() {
 
   # Remove kharej UFW rules if active
   if ufw_is_active; then
-    ensure_ssh_access_with_ufw || true
-    ufw_delete_managed_rules || true
+    ufw_delete_managed_rules preserve-ssh || true
     ufw_remove_gre_proto47_block || true
     ufw_before_rules_test "/etc/ufw/before.rules" || true
     ufw reload >/dev/null 2>&1 || true
@@ -575,12 +602,12 @@ case "${1:-start}" in
 esac
 EOF
 
-  chmod +x "$APPLY_SCRIPT"
+  chmod +x "$APPLY_SCRIPT" || return
   log "Installed: $APPLY_SCRIPT"
 }
 
 install_systemd_unit() {
-  cat > "$UNIT_FILE" <<EOF
+  cat > "$UNIT_FILE" <<EOF || return
 [Unit]
 Description=GRE4 Tunnel (Iran/Kharej) + NAT/Firewall
 Wants=network-online.target
@@ -596,9 +623,18 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now gre4.service
+  systemctl daemon-reload || return
+  systemctl enable --now gre4.service || return
   log "Systemd service enabled: gre4.service"
+}
+
+setup_deployment() {
+  if service_installed; then
+    systemctl stop gre4.service || return
+  fi
+  write_conf "$@" || return
+  install_apply_script || return
+  install_systemd_unit
 }
 
 remove_everything() {
@@ -656,9 +692,7 @@ main() {
         exit 1
       fi
 
-      write_conf "iran" "$iran_ip" "$kharej_ip" "$ports" "$allow_udp"
-      install_apply_script
-      install_systemd_unit
+      setup_deployment "iran" "$iran_ip" "$kharej_ip" "$ports" "$allow_udp" || return
       log "Iran configured. Test: ip a show $TUN_IF ; iptables -t nat -S"
       ;;
     2)
@@ -677,9 +711,7 @@ main() {
         exit 1
       fi
 
-      write_conf "kharej" "$kharej_ip" "$iran_ip" "$ports" "$allow_udp"
-      install_apply_script
-      install_systemd_unit
+      setup_deployment "kharej" "$kharej_ip" "$iran_ip" "$ports" "$allow_udp" || return
       log "Kharej configured. Test: ip a show $TUN_IF ; ufw status verbose (if active)"
       ;;
     3)
