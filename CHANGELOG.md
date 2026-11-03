@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Preserve managed SSH allowances for ports specified by OpenSSH ListenAddress,
+  including IPv6 listeners.
+- Refuse to discard deployment recovery files while inactive UFW retains GRE4
+  rules, including encoded UFW comments.
+- Replace configuration atomically and preserve it on write or permission errors.
+- Tag newly installed iptables rules and remove only owned rules; preserve
+  untagged administrator and legacy rules for manual review.
+- Validate real UFW file transformations with temporary fixtures; reject missing
+  filter tables and malformed managed blocks without replacing the original.
+- Record and restore owned forwarding/conntrack changes on stop, failed-start
+  cleanup, and uninstall; preserve administrator changes and retry failed recovery.
+  Legacy sysctl files without recovery records require manual review.
+
 ## 1.0.0 - 2026-11-03
 
 ### Added

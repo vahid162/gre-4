@@ -11,6 +11,10 @@ KHAREJ_TUN_CIDR="172.16.1.2/30"
 CONF_FILE="/etc/gre4.conf"
 APPLY_SCRIPT="/usr/local/sbin/gre4-apply.sh"
 UNIT_FILE="/etc/systemd/system/gre4.service"
+STATE_DIR="/var/lib/gre4"
+SYSCTL_DIR="/etc/sysctl.d"
+UFW_DIR="/etc/ufw"
+UFW_BEFORE_FILE="$UFW_DIR/before.rules"
 
 log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
@@ -253,7 +257,9 @@ ensure_cmd() {
 
 write_conf() {
   local role="$1" local_pub="$2" peer_pub="$3" ports="$4" allow_udp="$5"
-  cat > "$CONF_FILE" <<EOF || return
+  local staged
+  staged=$(mktemp "${CONF_FILE}.tmp.XXXXXX") || return
+  cat > "$staged" <<EOF || { rm -f "$staged"; return 1; }
 ROLE="$role"
 LOCAL_PUBLIC_IP="$local_pub"
 PEER_PUBLIC_IP="$peer_pub"
@@ -263,14 +269,16 @@ TUN_IF="$TUN_IF"
 IRAN_TUN_CIDR="$IRAN_TUN_CIDR"
 KHAREJ_TUN_CIDR="$KHAREJ_TUN_CIDR"
 EOF
-  chmod 600 "$CONF_FILE" || return
+  chmod 600 "$staged" || { rm -f "$staged"; return 1; }
+  mv -f "$staged" "$CONF_FILE" || { rm -f "$staged"; return 1; }
   log "Config saved to $CONF_FILE"
 }
 
 install_apply_script() {
   local staged
   staged=$(mktemp "${APPLY_SCRIPT}.tmp.XXXXXX") || return
-  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\nCONF_FILE=%q\n' "$CONF_FILE" > "$staged"; then
+  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\nCONF_FILE=%q\nSTATE_DIR=%q\nSYSCTL_DIR=%q\nUFW_DIR=%q\nUFW_BEFORE_FILE=%q\n' \
+    "$CONF_FILE" "$STATE_DIR" "$SYSCTL_DIR" "$UFW_DIR" "$UFW_BEFORE_FILE" > "$staged"; then
     rm -f "$staged"
     return 1
   fi
@@ -294,10 +302,22 @@ ipt_add() {
   # usage: ipt_add <table> <chain> <rule...>
   local table="$1"; shift
   local chain="$1"; shift
+  local rc
   if iptables -t "$table" -C "$chain" "$@" 2>/dev/null; then
+    warn "Existing untagged iptables rule retained; GRE4 will not remove it: $table $chain $*"
     return 0
+  else
+    rc=$?
   fi
-  iptables -t "$table" -A "$chain" "$@"
+  # A missing rule returns 1; permission/lock failures must not create duplicates.
+  [[ "$rc" == 1 ]] || return "$rc"
+  if iptables -t "$table" -C "$chain" "$@" -m comment --comment gre4-managed 2>/dev/null; then
+    return 0
+  else
+    rc=$?
+    [[ "$rc" == 1 ]] || return "$rc"
+  fi
+  iptables -t "$table" -A "$chain" "$@" -m comment --comment gre4-managed
 }
 
 ipt_del_all() {
@@ -306,8 +326,8 @@ ipt_del_all() {
   local chain="$1"; shift
   local rc
   while true; do
-    if iptables -t "$table" -C "$chain" "$@" 2>/dev/null; then
-      iptables -t "$table" -D "$chain" "$@" || return
+    if iptables -t "$table" -C "$chain" "$@" -m comment --comment gre4-managed 2>/dev/null; then
+      iptables -t "$table" -D "$chain" "$@" -m comment --comment gre4-managed || return
     else
       rc=$?
       [[ "$rc" == 1 ]] && return 0
@@ -316,44 +336,177 @@ ipt_del_all() {
   done
 }
 
+# Recovery data stays separate from the removable deployment configuration.
 sysctl_apply_file() {
-  local file="$1"
+  local name="$1" file="$2"; shift 2
+  local root="$STATE_DIR/sysctl" state="$STATE_DIR/sysctl/$name" staged entry key value previous
+  [[ ! -L "$STATE_DIR" && ! -L "$root" ]] || { err "Unsafe sysctl state directory: $root"; return 1; }
+  mkdir -p "$root" || return
+  [[ -O "$STATE_DIR" && -O "$root" ]] || { err "Sysctl state directory must belong to this user: $root"; return 1; }
+  chmod 700 "$STATE_DIR" "$root" || return
+  if [[ -e "$state" || -L "$state" ]]; then
+    [[ -d "$state" && ! -L "$state" && -O "$state" && -f "$state/file" && ! -L "$state/file" ]] || return 1
+    if [[ -e "$state/restore" || -e "$state/restored" ]]; then
+      err "Sysctl recovery is pending; run stop successfully before starting again. State: $state"
+      return 1
+    fi
+  else
+    if [[ -e "$file" || -L "$file" ]]; then
+      err "Refusing unowned sysctl file $file. Move it aside and recover its settings manually before retrying."
+      return 1
+    fi
+    staged=$(mktemp -d "$root/.capture.XXXXXX") || return
+    for entry in "$@"; do
+      key=${entry%%=*}; value=${entry#*=}
+      previous=$(sysctl -n "$key") || { rm -rf "$staged"; return 1; }
+      [[ "$previous" =~ ^[0-9]+$ && "$value" =~ ^[0-9]+$ ]] || { rm -rf "$staged"; return 1; }
+      printf '%s %s %s\n' "$key" "$previous" "$value" >> "$staged/values" || { rm -rf "$staged"; return 1; }
+      printf '%s\n' "$entry" >> "$staged/file" || { rm -rf "$staged"; return 1; }
+    done
+    # Publish the complete recovery record before the first persistent/runtime change.
+    mv -T "$staged" "$state" || { rm -rf "$staged"; return 1; }
+  fi
+  if [[ -e "$file" || -L "$file" ]]; then
+    if [[ -L "$file" || ! -f "$file" ]] || ! cmp -s "$state/file" "$file"; then
+      err "Preserving changed sysctl file $file; stop and resolve it manually before restarting."
+      return 1
+    fi
+  else
+    staged=$(mktemp "$SYSCTL_DIR/.gre4.XXXXXX") || return
+    if ! cp "$state/file" "$staged" || ! chmod 644 "$staged" || ! ln "$staged" "$file"; then
+      rm -f "$staged"
+      return 1
+    fi
+    rm -f "$staged" || return
+  fi
   sysctl -p "$file" >/dev/null
 }
 
 tune_forwarding() {
-  local f="/etc/sysctl.d/99-gre4-forward.conf"
-  cat > "$f" <<CONF
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.forwarding=1
-CONF
-  sysctl_apply_file "$f"
+  sysctl_apply_file forward "$SYSCTL_DIR/99-gre4-forward.conf" \
+    net.ipv4.ip_forward=1 net.ipv4.conf.all.forwarding=1
 }
 
 tune_conntrack_if_kharej() {
-  # Only on kharej role (protects UFW + heavy inbound scans)
   [[ "$ROLE" == "kharej" ]] || return 0
-
   local mem_kb mem_mb target
-  mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+  mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo) || return
   mem_mb=$((mem_kb/1024))
-
-  # Conservative values for low RAM (e.g. 1GB)
-  if [[ "$mem_mb" -ge 2048 ]]; then
-    target=262144
-  elif [[ "$mem_mb" -ge 1024 ]]; then
-    target=131072
-  else
-    target=65536
+  if [[ "$mem_mb" -ge 2048 ]]; then target=262144
+  elif [[ "$mem_mb" -ge 1024 ]]; then target=131072
+  else target=65536
   fi
-
-  local f="/etc/sysctl.d/99-gre4-conntrack.conf"
-  cat > "$f" <<CONF
-net.netfilter.nf_conntrack_max=$target
-CONF
-  sysctl_apply_file "$f"
+  sysctl_apply_file conntrack "$SYSCTL_DIR/99-gre4-conntrack.conf" \
+    "net.netfilter.nf_conntrack_max=$target" || return
   log "conntrack tuned: nf_conntrack_max=$target"
 }
+
+restore_sysctl_file() {
+  local name="$1" file="$2" state="$STATE_DIR/sysctl/$1"
+  local key previous applied extra current wanted alternate staged index failed=0
+  local -a keys=() originals=() targets=() desired=() observed=() alternatives=() expected=() now=()
+  if [[ ! -e "$state" && ! -L "$state" ]]; then
+    if [[ -e "$file" || -L "$file" ]]; then
+      err "Unowned sysctl file $file has no recovery record; preserve it and recover settings manually."
+      return 1
+    fi
+    return 0
+  fi
+  [[ -d "$state" && ! -L "$state" && -O "$state" ]] || { err "Unsafe sysctl recovery state: $state"; return 1; }
+  [[ -f "$state/file" && ! -L "$state/file" ]] || return 1
+  if [[ ! -e "$state/restored" ]]; then
+    [[ -f "$state/values" && ! -L "$state/values" ]] || return 1
+    case "$name" in
+      forward) expected=(net.ipv4.ip_forward net.ipv4.conf.all.forwarding) ;;
+      conntrack) expected=(net.netfilter.nf_conntrack_max) ;;
+      *) return 1 ;;
+    esac
+    while read -r key previous applied extra; do
+      index=${#keys[@]}
+      [[ "$key" == "${expected[$index]:-}" && "$previous" =~ ^[0-9]+$ && "$applied" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+      keys+=("$key"); originals+=("$previous"); targets+=("$applied")
+    done < "$state/values"
+    [[ ${#keys[@]} == "${#expected[@]}" ]] || return 1
+    if [[ ! -e "$state/restore" && ! -L "$state/restore" ]]; then
+      staged=$(mktemp "$state/.restore.XXXXXX") || return
+      for index in "${!keys[@]}"; do
+        current=$(sysctl -n "${keys[$index]}") || { rm -f "$staged"; return 1; }
+        [[ "$current" =~ ^[0-9]+$ ]] || { rm -f "$staged"; return 1; }
+        wanted="$current"
+        [[ "$current" != "${targets[$index]}" ]] || wanted="${originals[$index]}"
+        desired+=("$wanted")
+        alternate="$current"
+        # ip_forward resets all.forwarding; save both acceptable values before that write.
+        [[ "${keys[$index]}" != net.ipv4.conf.all.forwarding ]] || alternate="${desired[0]}"
+        printf '%s %s %s %s\n' "${keys[$index]}" "$wanted" "$current" "$alternate" >> "$staged" || { rm -f "$staged"; return 1; }
+      done
+      mv -T "$staged" "$state/restore" || { rm -f "$staged"; return 1; }
+    fi
+    [[ -f "$state/restore" && ! -L "$state/restore" ]] || return 1
+    desired=()
+    while read -r key wanted current alternate extra; do
+      index=${#desired[@]}
+      [[ "$key" == "${keys[$index]:-}" && "$wanted" =~ ^[0-9]+$ && "$current" =~ ^[0-9]+$ && "$alternate" =~ ^[0-9]+$ && -z "$extra" ]] || return 1
+      desired+=("$wanted"); observed+=("$current"); alternatives+=("$alternate")
+    done < "$state/restore"
+    [[ ${#desired[@]} == "${#keys[@]}" ]] || return 1
+    # Capture intervening administrator changes before ip_forward can reset them.
+    for key in "${keys[@]}"; do
+      current=$(sysctl -n "$key") || return
+      [[ "$current" =~ ^[0-9]+$ ]] || return 1
+      now+=("$current")
+    done
+    staged=$(mktemp "$state/.restore.XXXXXX") || return
+    for index in "${!keys[@]}"; do
+      current="${now[$index]}"
+      if [[ "$current" != "${desired[$index]}" && "$current" != "${observed[$index]}" ]]; then
+        if [[ "${keys[$index]}" != net.ipv4.conf.all.forwarding || "$current" != "${alternatives[$index]}" || "${now[0]}" != "${desired[0]}" ]]; then
+          desired[$index]="$current"
+          warn "Preserving administrator change to ${keys[$index]}."
+        fi
+      fi
+      observed[$index]="$current"
+      alternatives[$index]="$current"
+      [[ "${keys[$index]}" != net.ipv4.conf.all.forwarding ]] || alternatives[$index]="${desired[0]}"
+      printf '%s %s %s %s\n' "${keys[$index]}" "${desired[$index]}" "$current" "${alternatives[$index]}" >> "$staged" || { rm -f "$staged"; return 1; }
+    done
+    mv -T "$staged" "$state/restore" || { rm -f "$staged"; return 1; }
+    # Remove persistence before restoring runtime, after validating recovery data.
+    if [[ -e "$file" || -L "$file" ]]; then
+      if [[ ! -L "$file" && -f "$file" ]] && cmp -s "$state/file" "$file"; then
+        rm -f "$file" || return
+      fi
+    fi
+    for index in "${!keys[@]}"; do
+      key="${keys[$index]}"
+      current=$(sysctl -n "$key") || { failed=1; continue; }
+      if [[ "$current" == "${desired[$index]}" ]]; then continue; fi
+      if [[ "$current" == "${observed[$index]}" || "$current" == "${alternatives[$index]}" ]]; then
+        sysctl -w "$key=${desired[$index]}" >/dev/null || failed=1
+      else
+        warn "Preserving administrator change to $key."
+      fi
+    done
+    [[ "$failed" == 0 ]] || { err "Sysctl recovery failed; state retained in $state for retry."; return 1; }
+  fi
+  touch "$state/restored" || return
+  if [[ -e "$file" || -L "$file" ]]; then
+    warn "Preserving administrator-modified $file (ownership record retained in $state)."
+    return 0
+  fi
+  rm -rf "$state" || return
+}
+
+restore_sysctl() {
+  local failed=0 root="$STATE_DIR/sysctl"
+  if [[ -L "$STATE_DIR" || -L "$root" ]]; then err "Unsafe sysctl state directory: $root"; return 1; fi
+  restore_sysctl_file forward "$SYSCTL_DIR/99-gre4-forward.conf" || failed=1
+  restore_sysctl_file conntrack "$SYSCTL_DIR/99-gre4-conntrack.conf" || failed=1
+  # Leave unrelated state, and ownership records for administrator-modified files.
+  rmdir "$root" "$STATE_DIR" 2>/dev/null || true
+  return "$failed"
+}
+
 
 setup_gre() {
   ensure_cmd ip
@@ -385,17 +538,9 @@ setup_iran_nat() {
   # Backup current rules (best-effort)
   iptables-save > "/root/iptables.backup.gre4.$(date +%F_%H%M%S).txt" 2>/dev/null || true
 
-  # Remove old wide DNAT rules if present (the old bug)
-  ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
-  ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
-
-  # Remove old per-port rules to avoid duplicates
+  # Untagged legacy rules cannot be distinguished from administrator-owned rules.
   local p
   IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
-  for p in "${ports[@]}"; do
-    ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
-    ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
-  done
 
   # Add selected port(s)
   for p in "${ports[@]}"; do
@@ -434,9 +579,18 @@ ufw_before_rules_test() {
   iptables-restore --test < "$file"
 }
 
+ufw_strip_gre_block() {
+  awk '
+    $0=="# gre4.sh BEGIN" { if (skip) exit 1; skip=1; next }
+    $0=="# gre4.sh END" { if (!skip) exit 1; skip=0; next }
+    !skip { print }
+    END { if (skip) exit 1 }
+  ' "$1"
+}
+
 ufw_allow_gre_proto47() {
   # UFW before.rules uses iptables-restore format; rules must be inserted inside *filter table before its COMMIT.
-  local before="/etc/ufw/before.rules"
+  local before="$UFW_BEFORE_FILE"
   [[ -f "$before" ]] || return 0
 
   local begin="# gre4.sh BEGIN"
@@ -444,13 +598,16 @@ ufw_allow_gre_proto47() {
   local rule_in="-A ufw-before-input -p 47 -s ${PEER_PUBLIC_IP} -d ${LOCAL_PUBLIC_IP} -j ACCEPT"
   local rule_out="-A ufw-before-output -p 47 -s ${LOCAL_PUBLIC_IP} -d ${PEER_PUBLIC_IP} -j ACCEPT"
 
-  awk -v b="$begin" -v e="$end" '
-    $0==b{skip=1;next}
-    $0==e{skip=0;next}
-    !skip{print}
-  ' "$before" > "${before}.tmp.clean"
+  local clean staged
+  clean=$(mktemp "${before}.clean.XXXXXX") || return
+  staged=$(mktemp "${before}.tmp.XXXXXX") || { rm -f "$clean"; return 1; }
+  if ! ufw_strip_gre_block "$before" > "$clean"; then
+    rm -f "$clean" "$staged"
+    err "Unbalanced GRE block in $before; keeping original file."
+    return 1
+  fi
 
-  awk -v b="$begin" -v e="$end" -v rin="$rule_in" -v rout="$rule_out" '
+  if ! awk -v b="$begin" -v e="$end" -v rin="$rule_in" -v rout="$rule_out" '
     {
       if($0=="*filter"){ in_filter=1 }
       if(in_filter && $0=="COMMIT" && !inserted){
@@ -466,38 +623,47 @@ ufw_allow_gre_proto47() {
     END {
       if(!inserted) exit 42
     }
-  ' "${before}.tmp.clean" > "${before}.tmp"
+  ' "$clean" > "$staged"; then
+    rm -f "$clean" "$staged"
+    err "Cannot find a complete filter table in $before; keeping original file."
+    return 1
+  fi
 
-  if ! ufw_before_rules_test "${before}.tmp"; then
-    rm -f "${before}.tmp.clean" "${before}.tmp"
+  if ! ufw_before_rules_test "$staged"; then
+    rm -f "$clean" "$staged"
     err "Invalid $before after GRE block insert; aborting UFW update."
     return 1
   fi
 
-  mv "${before}.tmp" "$before"
-  rm -f "${before}.tmp.clean"
+  if ! chmod --reference="$before" "$staged" || ! mv "$staged" "$before"; then
+    rm -f "$clean" "$staged"
+    return 1
+  fi
+  rm -f "$clean"
 }
 
 ufw_remove_gre_proto47_block() {
-  local before="/etc/ufw/before.rules"
+  local before="$UFW_BEFORE_FILE"
   [[ -f "$before" ]] || return 0
 
-  local begin="# gre4.sh BEGIN"
-  local end="# gre4.sh END"
+  local staged
+  staged=$(mktemp "${before}.tmp.XXXXXX") || return
+  if ! ufw_strip_gre_block "$before" > "$staged"; then
+    rm -f "$staged"
+    err "Unbalanced GRE block in $before; keeping original file."
+    return 1
+  fi
 
-  awk -v b="$begin" -v e="$end" '
-    $0==b{skip=1;next}
-    $0==e{skip=0;next}
-    !skip{print}
-  ' "$before" > "${before}.tmp"
-
-  if ! ufw_before_rules_test "${before}.tmp"; then
-    rm -f "${before}.tmp"
+  if ! ufw_before_rules_test "$staged"; then
+    rm -f "$staged"
     err "Invalid $before after GRE block removal; keeping original file."
     return 1
   fi
 
-  mv "${before}.tmp" "$before"
+  if ! chmod --reference="$before" "$staged" || ! mv "$staged" "$before"; then
+    rm -f "$staged"
+    return 1
+  fi
 }
 
 ufw_delete_managed_rules() {
@@ -514,7 +680,11 @@ ufw_delete_managed_rules() {
       return 1
     fi
     while read -r key p _; do
-      [[ "$key" == "port" ]] || continue
+      case "$key" in
+        port) ;;
+        listenaddress) p="${p##*:}" ;;
+        *) continue ;;
+      esac
       if [[ ! "$p" =~ ^[0-9]{1,5}$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then
         warn "Invalid SSH port; keeping managed UFW rules."
         return 1
@@ -546,6 +716,25 @@ ufw_delete_managed_rules() {
   ' <<< "$status" | sort -rn)
   for n in "${nums[@]}"; do
     ufw --force delete "$n" >/dev/null || return
+  done
+}
+
+ufw_check_inactive_cleanup() {
+  # Inactive UFW still has persistent rules; do not discard their recovery files.
+  local file
+  for file in "$UFW_DIR/user.rules" "$UFW_DIR/user6.rules" "$UFW_BEFORE_FILE"; do
+    [[ -e "$file" ]] || continue
+    if [[ ! -r "$file" ]]; then
+      err "Cannot inspect persistent UFW rules: $file"
+      return 1
+    fi
+    if grep -Eq 'gre4-managed|677265342d6d616e61676564|^# gre4.sh (BEGIN|END)$' "$file"; then
+      err "UFW is inactive but GRE4 rules remain in $file. Keep recovery files; clean the owned rules before retrying."
+      return 1
+    else
+      local rc=$?
+      [[ "$rc" == 1 ]] || return "$rc"
+    fi
   done
 }
 
@@ -622,7 +811,7 @@ setup_kharej_ufw() {
     done
   done
 
-  ufw_before_rules_test "/etc/ufw/before.rules"
+  ufw_before_rules_test "$UFW_BEFORE_FILE"
   ufw reload >/dev/null || return
   log "UFW updated (public port access enabled)."
 }
@@ -648,8 +837,6 @@ stop_all() {
 
   # Attempt every cleanup step, but report any operational failure.
   if command -v iptables >/dev/null 2>&1; then
-    ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535 || failed=1
-    ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535 || failed=1
     for p in "${ports[@]}"; do
       ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}" || failed=1
       ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}" || failed=1
@@ -664,15 +851,19 @@ stop_all() {
   if ufw_is_active; then
     ufw_delete_managed_rules preserve-ssh || failed=1
     ufw_remove_gre_proto47_block || failed=1
-    ufw_before_rules_test "/etc/ufw/before.rules" || failed=1
+    ufw_before_rules_test "$UFW_BEFORE_FILE" || failed=1
     ufw reload >/dev/null 2>&1 || failed=1
   else
     local state=$?
-    if [[ "$state" != 1 ]]; then
+    if [[ "$state" == 1 ]]; then
+      ufw_check_inactive_cleanup || failed=1
+    else
       err "Cannot read UFW status during cleanup."
       failed=1
     fi
   fi
+
+  restore_sysctl || failed=1
 
   if [[ "$failed" != 0 ]]; then
     err "Cleanup incomplete; keep the configuration and retry before replacing or removing it."

@@ -63,6 +63,7 @@ the operation can be retried. A failed uninstall retains the configuration,
 apply script, and systemd unit for recovery.
 
 Existing managed SSH allow rules are retained with their original restrictions.
+This includes listener ports specified by `ListenAddress`, for IPv4 and IPv6.
 Cleanup creates no new SSH allowance. If installed OpenSSH has invalid or
 unreadable configuration, managed UFW rules are kept and cleanup fails. SSH
 servers other than OpenSSH are not detected.
@@ -72,9 +73,35 @@ for missing port, protocol, and address-family combinations, checking IPv4 and
 IPv6 separately. Required cleanup, rule deletion, or firewall reload failures
 return an error. The systemd unit also runs cleanup after a failed start.
 
-Rules orphaned by older versions, including `gre4-ssh-safety` allowances, are not
-removed automatically. Review the existing iptables/UFW rules before upgrading;
-do not delete an SSH allowance without confirming another access path.
+When UFW is inactive, cleanup checks its persistent rule files. If GRE4 rules
+remain, removal and configuration replacement fail and retain the deployment
+files for recovery. UFW is never enabled just to clean up. Review the owned rules
+and preserve SSH access before retrying with UFW active, or arrange offline
+cleanup yourself. An unreadable rule file also blocks cleanup.
+
+New iptables rules carry a `gre4-managed` ownership comment. Cleanup removes only
+tagged rules; matching administrator rules are preserved. Untagged rules from
+older versions, including wide DNAT rules, cannot safely be distinguished from
+administrator rules and need manual review. Legacy `gre4-ssh-safety` UFW allowances
+are not removed automatically either. Do not delete an SSH allowance without
+confirming another access path.
+
+Configuration updates are written to a temporary file and atomically replaced
+only after writing and setting private permissions succeeds. Failed replacement
+keeps the previous configuration available for recovery.
+
+New installations record the original forwarding and conntrack values under
+`/var/lib/gre4/sysctl` before changing them. Stopping the service, failed-start
+cleanup, and uninstall remove the owned sysctl files and restore those values.
+Later administrator changes are preserved. A failed restoration retains the
+recovery record so Stop or Remove can be retried.
+
+Existing sysctl files without a recovery record, including files from older
+GRE4 versions, are preserved and block automatic setup/cleanup. Their original
+values cannot be reconstructed safely. Review and recover those settings, then
+move the legacy files aside before retrying. Do not blindly disable forwarding
+on a host that other services also use. Administrator-edited files and their
+ownership records are retained; a new start requires resolving the edited file.
 
 ## Local regression checks
 
