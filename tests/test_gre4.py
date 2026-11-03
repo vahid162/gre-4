@@ -1,5 +1,6 @@
 """Regression checks with temporary files and substitutes, never host networking."""
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -16,12 +17,18 @@ ufw_is_active() { return 0; }
 ufw_remove_gre_proto47_block() { :; }
 ufw_allow_gre_proto47() { :; }
 ufw_before_rules_test() { :; }
+ufw_ipv6_enabled() { return 1; }
 sshd() { echo 'port 2222'; }
 ufw() {
   if [[ $1 == status ]]; then
     printf '%s\n' "$fixture"
   else
     commands+=("$*")
+    if [[ $1 == --force && $2 == delete ]]; then
+      fixture=$(awk -v number="$3" '
+        { current=$0; sub(/^\[[[:space:]]*/, "", current); sub(/\].*$/, "", current); if (current!=number) print }
+      ' <<< "$fixture")
+    fi
   fi
 }
 ROLE=kharej SERVICE_PORTS=443 ALLOW_UDP=no
@@ -29,6 +36,38 @@ ROLE=kharej SERVICE_PORTS=443 ALLOW_UDP=no
 
 
 class Gre4Tests(unittest.TestCase):
+    def test_generated_apply_loads_quoted_config_path(self):
+        with tempfile.TemporaryDirectory(prefix="gre4-generate-") as scratch:
+            config = Path(scratch) / 'config with spaces'
+            config.write_text('ROLE=iran\nSERVICE_PORTS=443\n')
+            apply = Path(scratch) / 'apply.sh'
+            subprocess.run(
+                ['bash', '-s', '--', str(apply), str(config)],
+                input=FUNCTIONS + '\nAPPLY_SCRIPT=$1\nCONF_FILE=$2\ninstall_apply_script\n',
+                text=True, capture_output=True, check=True, timeout=5,
+            )
+            result = subprocess.run(
+                ['bash', str(apply), '__gre4_test_invalid_action__'],
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('Usage:', result.stdout)
+            self.assertNotIn('Missing', result.stdout + result.stderr)
+
+    def test_failed_apply_installation_preserves_previous_script(self):
+        with tempfile.TemporaryDirectory(prefix="gre4-generate-") as scratch:
+            result = subprocess.run(
+                ['bash', '-s', '--', scratch],
+                input=FUNCTIONS + r'''
+APPLY_SCRIPT=$1/apply.sh
+printf 'previous helper\n' > "$APPLY_SCRIPT"
+chmod() { return 1; }
+if install_apply_script; then exit 1; fi
+[[ $(cat "$APPLY_SCRIPT") == 'previous helper' ]]
+''', text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def run_shell(self, body, expected=0):
         with tempfile.TemporaryDirectory(prefix="gre4-test-") as scratch:
             generated = Path(scratch) / "apply.sh"
@@ -43,7 +82,10 @@ class Gre4Tests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "-s", "--", scratch],
                 input=(FUNCTIONS + '\n' + apply_functions
-                       + '\nCONF_FILE=$1/config\nAPPLY_SCRIPT=$1/apply.sh\nUNIT_FILE=$1/unit\n'
+                       + '\nCONF_FILE=$1/config\nAPPLY_SCRIPT=$1/installed-apply.sh\nUNIT_FILE=$1/unit\n'
+                       + "printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$APPLY_SCRIPT\"\n"
+                       + 'chmod +x "$APPLY_SCRIPT"\necho old-unit > "$UNIT_FILE"\n'
+                       + "install_apply_script() { printf '#!/usr/bin/env bash\\n# refreshed cleanup\\nexit 0\\n' > \"$APPLY_SCRIPT\"; chmod +x \"$APPLY_SCRIPT\"; }\n"
                        + body),
                 text=True, capture_output=True, timeout=5,
             )
@@ -118,7 +160,7 @@ stop_all
         self.run_shell(UFW_STUBS + r'''
 fixture='[ 1] 2222/tcp ALLOW IN Anywhere # gre4-managed'
 sshd() { return 1; }
-stop_all
+if stop_all; then exit 1; fi
 [[ ${commands[*]} == reload ]]
 ''')
 
@@ -127,7 +169,7 @@ stop_all
 fixture='[ 1] 2222/tcp on eth0 ALLOW IN 203.0.113.10 # gre4-managed
 [ 2] 443/tcp ALLOW IN Anywhere # gre4-managed'
 setup_kharej_ufw
-[[ ${commands[*]} == '--force delete 2 allow 443/tcp comment gre4-managed reload' ]]
+[[ ${commands[*]} == '--force delete 2 allow proto tcp from any to 0.0.0.0/0 port 443 comment gre4-managed reload' ]]
 ''')
 
     def test_unreliable_ssh_detection_never_deletes_rules(self):
@@ -135,7 +177,7 @@ setup_kharej_ufw
             with self.subTest(config=config):
                 self.run_shell(UFW_STUBS + f"sshd() {{ echo '{config}'; }}\n" + r'''
 fixture='[ 1] 2222/tcp ALLOW IN Anywhere # gre4-managed'
-stop_all
+if stop_all; then exit 1; fi
 [[ ${commands[*]} == reload ]]
 ''')
 
@@ -157,7 +199,7 @@ if ufw_delete_managed_rules preserve-ssh; then exit 1; fi
 fixture='Status: active'
 sshd() { return 1; }
 setup_kharej_ufw
-[[ ${commands[*]} == 'allow 443/tcp comment gre4-managed reload' ]]
+[[ ${commands[*]} == 'allow proto tcp from any to 0.0.0.0/0 port 443 comment gre4-managed reload' ]]
 ''')
 
     def test_repeated_setup_stops_old_deployment_and_applies_new_config(self):
@@ -226,11 +268,10 @@ start_all
 write_conf iran 192.0.2.1 198.51.100.1 80,443 no
 echo old-unit > "$UNIT_FILE"
 before=$(cat "$CONF_FILE")
-old_apply=$(cat "$APPLY_SCRIPT")
 systemctl() { return 1; }
 if setup_deployment kharej 192.0.2.2 198.51.100.2 2096 yes; then exit 1; fi
 [[ $(cat "$CONF_FILE") == "$before" ]]
-[[ $(cat "$APPLY_SCRIPT") == "$old_apply" ]]
+[[ -x $APPLY_SCRIPT ]]
 [[ $(cat "$UNIT_FILE") == old-unit ]]
 ''')
 
@@ -249,8 +290,176 @@ command() {
   builtin command "$@"
 }
 setup_kharej_ufw
-[[ ${commands[*]} == '--force delete 1 allow 443/tcp comment gre4-managed reload' ]]
+[[ ${commands[*]} == '--force delete 1 allow proto tcp from any to 0.0.0.0/0 port 443 comment gre4-managed reload' ]]
 ''')
+
+    def test_firewall_stop_failure_is_reported(self):
+        output = self.run_shell(UFW_STUBS + r'''
+fixture='Status: active'
+ufw() {
+  if [[ $1 == status ]]; then printf '%s\n' "$fixture"; return; fi
+  [[ $1 != reload ]]
+}
+stop_all
+''', expected=1)
+        self.assertNotIn("Stop done", output)
+
+    def test_uninstall_failure_preserves_cleanup_files(self):
+        self.run_shell(r'''
+write_conf iran 192.0.2.1 198.51.100.1 80,443 no
+printf '#!/usr/bin/env bash\nexit 1\n' > "$APPLY_SCRIPT"
+chmod +x "$APPLY_SCRIPT"
+install_apply_script() { :; }
+echo old-unit > "$UNIT_FILE"
+systemctl() { :; }
+ip() { return 1; }
+if remove_everything; then exit 1; fi
+[[ -f $CONF_FILE && -x $APPLY_SCRIPT && -f $UNIT_FILE ]]
+''')
+
+    def test_failed_activation_has_post_stop_cleanup(self):
+        self.run_shell(r'''
+systemctl() { :; }
+install_systemd_unit
+grep -Fxq "ExecStopPost=$APPLY_SCRIPT stop" "$UNIT_FILE"
+! grep -q '^ExecStop=' "$UNIT_FILE"
+''')
+
+    def test_existing_public_rules_are_preserved_per_address_family(self):
+        v4 = '[ 1] 443/tcp ALLOW IN Anywhere # administrator-web'
+        v6 = '[ 2] 443/tcp (v6) ALLOW IN Anywhere (v6) # administrator-web'
+        add4 = 'allow proto tcp from any to 0.0.0.0/0 port 443 comment gre4-managed'
+        add6 = 'allow proto tcp from any to ::/0 port 443 comment gre4-managed'
+        cases = [(v4, add6), (v6, add4), (v4 + '\n' + v6, ''),
+                 ('Status: active', add4 + ' ' + add6)]
+        for fixture, additions in cases:
+            with self.subTest(fixture=fixture):
+                self.run_shell(UFW_STUBS + '\nfixture=' + shlex.quote(fixture) + '\n'
+                               + 'original=$fixture\nufw_ipv6_enabled() { return 0; }\n'
+                               + 'setup_kharej_ufw\n'
+                               + '[[ $fixture == "$original" ]]\n'
+                               + '[[ ${commands[*]} == ' + shlex.quote((additions + ' reload').strip()) + ' ]]\n')
+
+    def test_only_unrestricted_inbound_allows_suppress_additions(self):
+        cases = [
+            ('443/tcp ALLOW IN Anywhere # human-comment', True),
+            ('443/tcp ALLOW IN Anywhere (log-all) # human-comment', True),
+            ('443/tcp ALLOW IN 203.0.113.10 # human-comment', False),
+            ('443/tcp on eth0 ALLOW IN Anywhere # human-comment', False),
+            ('192.0.2.1 443/tcp ALLOW IN Anywhere # human-comment', False),
+            ('443/tcp ALLOW IN Anywhere 1234 # human-comment', False),
+            ('443/tcp DENY IN Anywhere # human-comment', False),
+            ('443/tcp ALLOW OUT Anywhere # human-comment', False),
+            ('443/udp ALLOW IN Anywhere # human-comment', False),
+        ]
+        for rule, allowed in cases:
+            with self.subTest(rule=rule):
+                self.run_shell('status=' + shlex.quote('[ 1] ' + rule) + '\n'
+                               + 'if ufw_has_public_allow "$status" 443 tcp 4; then found=yes; else found=no; fi\n'
+                               + f'[[ $found == {"yes" if allowed else "no"} ]]\n')
+
+    @unittest.skipUnless(Path('/proc/sys/net/ipv6').is_dir(), 'Kernel IPv6 unavailable')
+    def test_ufw_ipv6_configuration_precedence(self):
+        self.run_shell(r'''
+echo 'IPV6=yes' > "$1/defaults"
+echo 'ENABLED=yes' > "$1/ufw.conf"
+ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"
+echo 'IPV6="no"' > "$1/ufw.conf"
+if ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"; then exit 1; fi
+echo 'IPV6="yes"' > "$1/ufw.conf"
+ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"
+echo 'IPV6=no' > "$1/defaults"
+echo "IPV6='yes'" > "$1/ufw.conf"
+if ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"; then exit 1; fi
+echo 'IPV6=yes' > "$1/defaults"
+echo "IPV6='no'" > "$1/ufw.conf"
+ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"
+echo 'IPV6= no' > "$1/ufw.conf"
+ufw_ipv6_enabled "$1/defaults" "$1/ufw.conf"
+''')
+
+    def test_inactive_service_cleanup_failure_preserves_old_config(self):
+        self.run_shell(r'''
+write_conf iran 192.0.2.1 198.51.100.1 80,443 no
+before=$(cat "$CONF_FILE")
+printf '#!/usr/bin/env bash\nexit 1\n' > "$APPLY_SCRIPT"
+chmod +x "$APPLY_SCRIPT"
+install_apply_script() { :; }
+systemctl() { :; }
+if update_conf iran 192.0.2.1 198.51.100.1 443 no; then exit 1; fi
+[[ $(cat "$CONF_FILE") == "$before" ]]
+''')
+
+    def test_iptables_cleanup_failures_are_bounded_and_propagated(self):
+        self.run_shell(r'''
+calls=0
+iptables() { calls=$((calls+1)); [[ $3 == -C ]]; }
+if ipt_del_all nat PREROUTING -p tcp --dport 443; then exit 1; fi
+[[ $calls == 2 ]]
+iptables() { return 4; }
+if ipt_del_all nat PREROUTING -p tcp --dport 443; then exit 1; fi
+''')
+
+    def test_disabling_udp_removes_previous_udp_rules(self):
+        self.run_shell(r'''
+declare -A rules=()
+for proto in tcp udp; do
+  rules["nat PREROUTING -p $proto --dport 443 -j DNAT --to-destination 172.16.1.2:443"]=1
+  rules["filter FORWARD -o GRE -p $proto -d 172.16.1.2/32 --dport 443 -j ACCEPT"]=1
+done
+iptables() {
+  local table=$2 op=$3 chain=$4 key
+  shift 4
+  key="$table $chain $*"
+  case $op in
+    -C) [[ ${rules[$key]:-} == 1 ]] ;;
+    -D) unset 'rules[$key]' ;;
+    *) return 99 ;;
+  esac
+}
+ip() { return 1; }
+ufw_is_active() { return 1; }
+systemctl() {
+  source "$CONF_FILE"
+  case $1 in
+    stop) stop_all ;;
+    start)
+      [[ $ALLOW_UDP == no ]]
+      rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443']=1
+      ;;
+    *) return 99 ;;
+  esac
+}
+write_conf iran 192.0.2.1 198.51.100.1 443 yes
+manage_toggle_udp <<<no
+[[ ! ${rules['nat PREROUTING -p udp --dport 443 -j DNAT --to-destination 172.16.1.2:443']:-} ]]
+[[ ! ${rules['filter FORWARD -o GRE -p udp -d 172.16.1.2/32 --dport 443 -j ACCEPT']:-} ]]
+[[ ${rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443']:-} == 1 ]]
+''')
+
+    def test_upgrade_uses_new_cleanup_before_replacing_config(self):
+        self.run_shell(r'''
+write_conf iran 192.0.2.1 198.51.100.1 80,443 no
+before=$(cat "$CONF_FILE")
+install_apply_script() {
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$APPLY_SCRIPT"
+  chmod +x "$APPLY_SCRIPT"
+}
+systemctl() { :; }
+if setup_deployment iran 192.0.2.2 198.51.100.2 443 no; then exit 1; fi
+[[ $(cat "$CONF_FILE") == "$before" ]]
+[[ -f $UNIT_FILE && -x $APPLY_SCRIPT ]]
+''')
+
+    def test_ufw_status_query_error_is_not_treated_as_inactive(self):
+        output = self.run_shell(r'''
+ip() { return 1; }
+iptables() { return 1; }
+ufw() { return 1; }
+TUN_IF=GRE ROLE=kharej SERVICE_PORTS=443
+stop_all
+''', expected=1)
+        self.assertNotIn('Stop done', output)
 
     def test_failed_stop_preserves_configuration(self):
         self.run_shell(r'''

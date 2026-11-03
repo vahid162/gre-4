@@ -112,11 +112,25 @@ restart_service() {
 }
 
 update_conf() {
-  # ExecStop must read the configuration that created the current rules.
-  systemctl stop gre4.service || return
+  # Cleanup must read the configuration that created the current rules.
+  stop_deployment || return
   write_conf "$@" || return
   systemctl start gre4.service || return
   log "Configuration applied: gre4.service"
+}
+
+stop_deployment() {
+  # Upgrade cleanup first: older installed helpers can hide firewall errors.
+  if [[ -f "$CONF_FILE" ]]; then
+    install_apply_script || return
+  fi
+  if [[ -f "$UNIT_FILE" ]]; then
+    systemctl stop gre4.service || return
+  fi
+  # An inactive/failed unit may still have rules from an earlier failed cleanup.
+  if [[ -x "$APPLY_SCRIPT" && -f "$CONF_FILE" ]]; then
+    "$APPLY_SCRIPT" stop || return
+  fi
 }
 
 show_status() {
@@ -254,11 +268,13 @@ EOF
 }
 
 install_apply_script() {
-  cat > "$APPLY_SCRIPT" <<'EOF' || return
-#!/usr/bin/env bash
-set -euo pipefail
-
-CONF_FILE="/etc/gre4.conf"
+  local staged
+  staged=$(mktemp "${APPLY_SCRIPT}.tmp.XXXXXX") || return
+  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\nCONF_FILE=%q\n' "$CONF_FILE" > "$staged"; then
+    rm -f "$staged"
+    return 1
+  fi
+  cat >> "$staged" <<'EOF' || { rm -f "$staged"; return 1; }
 [[ -f "$CONF_FILE" ]] || { echo "Missing $CONF_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF_FILE"
@@ -288,8 +304,15 @@ ipt_del_all() {
   # delete while exists
   local table="$1"; shift
   local chain="$1"; shift
-  while iptables -t "$table" -C "$chain" "$@" 2>/dev/null; do
-    iptables -t "$table" -D "$chain" "$@" || true
+  local rc
+  while true; do
+    if iptables -t "$table" -C "$chain" "$@" 2>/dev/null; then
+      iptables -t "$table" -D "$chain" "$@" || return
+    else
+      rc=$?
+      [[ "$rc" == 1 ]] && return 0
+      return "$rc"
+    fi
   done
 }
 
@@ -400,7 +423,9 @@ setup_iran_nat() {
 
 ufw_is_active() {
   command -v ufw >/dev/null 2>&1 || return 1
-  ufw status 2>/dev/null | head -n1 | grep -qi "Status: active"
+  local status
+  status=$(LC_ALL=C ufw status 2>/dev/null) || return 2
+  [[ "${status%%$'\n'*}" == "Status: active" ]]
 }
 
 ufw_before_rules_test() {
@@ -525,9 +550,51 @@ ufw_delete_managed_rules() {
 }
 
 
+ufw_ipv6_enabled() {
+  [[ -d /proc/sys/net/ipv6 ]] || return 1
+  local defaults="$1" config="$2"
+  [[ -r "$defaults" && -r "$config" ]] || return 1
+  awk -F= '
+    /^[[:alnum:]_]+="?[[:alnum:]_]+"?/ && tolower($1)=="ipv6" {
+      value=tolower($2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      sub(/^["\047]+/, "", value)
+      sub(/["\047]+$/, "", value)
+    }
+    END { exit value!="yes" }
+  ' "$defaults" "$config"
+}
+
+ufw_has_public_allow() {
+  local status="$1" port="$2" proto="$3" family="$4"
+  awk -v port="$port" -v proto="$proto" -v family="$family" '
+    BEGIN {
+      destination=port "/" proto
+      source="Anywhere"
+      if (family==6) { destination=destination " (v6)"; source=source " (v6)" }
+    }
+    /^\[[[:space:]]*[0-9]+\]/ {
+      rule=$0
+      sub(/#.*/, "", rule)
+      sub(/^\[[[:space:]]*[0-9]+\][[:space:]]*/, "", rule)
+      if (!match(rule, /[[:space:]]+ALLOW[[:space:]]+IN[[:space:]]+/)) next
+      dst=substr(rule, 1, RSTART-1)
+      src=substr(rule, RSTART+RLENGTH)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", dst)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", src)
+      sub(/[[:space:]]+\(log(-all)?\)$/, "", src)
+      if (dst==destination && src==source) found=1
+    }
+    END { exit !found }
+  ' <<< "$status"
+}
+
 setup_kharej_ufw() {
   [[ "$ROLE" == "kharej" ]] || return 0
-  ufw_is_active || return 0
+  local state=0
+  ufw_is_active || state=$?
+  if [[ "$state" == 1 ]]; then return 0; fi
+  if [[ "$state" != 0 ]]; then err "Cannot read UFW status."; return 1; fi
 
   log "UFW active: enabling public access for port(s) $SERVICE_PORTS"
 
@@ -537,14 +604,22 @@ setup_kharej_ufw() {
   # 2) Remove old service rules without revoking existing SSH access.
   ufw_delete_managed_rules preserve-ssh || return
 
-  # 3) Allow service port(s) publicly (all interfaces, including enp1s0 and GRE)
-  local p
+  # 3) Only claim new allowances; UFW replaces comments on identical rules.
+  local p proto family destination status
+  local -a protocols=(tcp) families=(4)
+  [[ "$ALLOW_UDP" != "yes" ]] || protocols+=(udp)
+  if ufw_ipv6_enabled /etc/default/ufw /etc/ufw/ufw.conf; then families+=(6); fi
+  status=$(LC_ALL=C ufw status numbered) || return
   IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
   for p in "${ports[@]}"; do
-    ufw allow "$p/tcp" comment 'gre4-managed' >/dev/null
-    if [[ "$ALLOW_UDP" == "yes" ]]; then
-      ufw allow "$p/udp" comment 'gre4-managed' >/dev/null
-    fi
+    for proto in "${protocols[@]}"; do
+      for family in "${families[@]}"; do
+        if ufw_has_public_allow "$status" "$p" "$proto" "$family"; then continue; fi
+        destination=0.0.0.0/0
+        if [[ "$family" == 6 ]]; then destination=::/0; fi
+        ufw allow proto "$proto" from any to "$destination" port "$p" comment 'gre4-managed' >/dev/null || return
+      done
+    done
   done
 
   ufw_before_rules_test "/etc/ufw/before.rules"
@@ -563,35 +638,46 @@ start_all() {
 
 stop_all() {
   ensure_cmd ip
+  local failed=0
   if ip link show "$TUN_IF" >/dev/null 2>&1; then
-    ip tunnel del "$TUN_IF" 2>/dev/null || true
+    ip tunnel del "$TUN_IF" 2>/dev/null || failed=1
   fi
 
   local p
   IFS=',' read -r -a ports <<<"$SERVICE_PORTS"
 
-  # Remove Iran rules if exist (best-effort)
+  # Attempt every cleanup step, but report any operational failure.
   if command -v iptables >/dev/null 2>&1; then
-    ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
-    ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535
+    ipt_del_all nat PREROUTING -p tcp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535 || failed=1
+    ipt_del_all nat PREROUTING -p udp --dport 1:65535 -j DNAT --to-destination 172.16.1.2:1-65535 || failed=1
     for p in "${ports[@]}"; do
-      ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
-      ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}"
-      ipt_del_all filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
-      ipt_del_all filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$p" -j ACCEPT
+      ipt_del_all nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}" || failed=1
+      ipt_del_all nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "172.16.1.2:${p}" || failed=1
+      ipt_del_all filter FORWARD -o "$TUN_IF" -p tcp -d 172.16.1.2/32 --dport "$p" -j ACCEPT || failed=1
+      ipt_del_all filter FORWARD -o "$TUN_IF" -p udp -d 172.16.1.2/32 --dport "$p" -j ACCEPT || failed=1
     done
-    ipt_del_all nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE
-    ipt_del_all filter FORWARD -i "$TUN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    ipt_del_all nat POSTROUTING -o "$TUN_IF" -d 172.16.1.2/32 -j MASQUERADE || failed=1
+    ipt_del_all filter FORWARD -i "$TUN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || failed=1
   fi
 
   # Remove kharej UFW rules if active
   if ufw_is_active; then
-    ufw_delete_managed_rules preserve-ssh || true
-    ufw_remove_gre_proto47_block || true
-    ufw_before_rules_test "/etc/ufw/before.rules" || true
-    ufw reload >/dev/null 2>&1 || true
+    ufw_delete_managed_rules preserve-ssh || failed=1
+    ufw_remove_gre_proto47_block || failed=1
+    ufw_before_rules_test "/etc/ufw/before.rules" || failed=1
+    ufw reload >/dev/null 2>&1 || failed=1
+  else
+    local state=$?
+    if [[ "$state" != 1 ]]; then
+      err "Cannot read UFW status during cleanup."
+      failed=1
+    fi
   fi
 
+  if [[ "$failed" != 0 ]]; then
+    err "Cleanup incomplete; keep the configuration and retry before replacing or removing it."
+    return 1
+  fi
   log "Stop done."
 }
 
@@ -602,7 +688,8 @@ case "${1:-start}" in
 esac
 EOF
 
-  chmod +x "$APPLY_SCRIPT" || return
+  chmod +x "$staged" || { rm -f "$staged"; return 1; }
+  mv -f "$staged" "$APPLY_SCRIPT" || { rm -f "$staged"; return 1; }
   log "Installed: $APPLY_SCRIPT"
 }
 
@@ -616,7 +703,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=$APPLY_SCRIPT start
-ExecStop=$APPLY_SCRIPT stop
+ExecStopPost=$APPLY_SCRIPT stop
 RemainAfterExit=yes
 
 [Install]
@@ -629,8 +716,8 @@ EOF
 }
 
 setup_deployment() {
-  if service_installed; then
-    systemctl stop gre4.service || return
+  if [[ -f "$CONF_FILE" || -f "$UNIT_FILE" ]]; then
+    stop_deployment || return
   fi
   write_conf "$@" || return
   install_apply_script || return
@@ -640,14 +727,15 @@ setup_deployment() {
 remove_everything() {
   warn "Removing GRE4 (service + tunnel + rules)..."
 
-  # best-effort cleanup first
-  if [[ -x "$APPLY_SCRIPT" && -f "$CONF_FILE" ]]; then
-    "$APPLY_SCRIPT" stop || true
+  if [[ -f "$CONF_FILE" || -f "$UNIT_FILE" ]]; then
+    stop_deployment || return
   fi
 
-  systemctl disable --now gre4.service >/dev/null 2>&1 || true
-  rm -f "$UNIT_FILE" "$APPLY_SCRIPT" "$CONF_FILE"
-  systemctl daemon-reload || true
+  if [[ -f "$UNIT_FILE" ]]; then
+    systemctl disable gre4.service || return
+  fi
+  rm -f "$UNIT_FILE" "$APPLY_SCRIPT" "$CONF_FILE" || return
+  systemctl daemon-reload || return
   warn "Removed files and disabled service."
 
   # Try to remove tunnel quickly
