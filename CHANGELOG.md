@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 - 2026-11-03
 
 ### Fixed
 
@@ -16,6 +16,19 @@
 - Record and restore owned forwarding/conntrack changes on stop, failed-start
   cleanup, and uninstall; preserve administrator changes and retry failed recovery.
   Legacy sysctl files without recovery records require manual review.
+
+### Upgrade notes
+
+- This release does not provide automatic migration or complete removal of
+  initial-version deployments. Untagged iptables rules and legacy
+  `gre4-ssh-safety` allowances require manual review.
+- Existing sysctl files without recovery records block automatic setup/cleanup.
+  Inactive UFW with remaining GRE4 rules also blocks cleanup while preserving
+  deployment recovery files.
+- Cleanup can stop the tunnel before reporting an error; use separate management
+  access when reviewing or removing an older deployment.
+- All 58 isolated regression tests pass. Live GRE/systemd/UFW integration on
+  disposable hosts remains unverified.
 
 ## 1.0.0 - 2026-11-03
 

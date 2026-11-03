@@ -15,12 +15,12 @@ matching UFW allowances when UFW is active.
 
 ## Recommended: a verified release
 
-For a published v1.0.0 release, download the script and its checksum file from
+For a published v1.0.1 release, download the script and its checksum file from
 the release assets, then verify before running it. If the assets are not yet
 available, use the main-branch download below:
 
 ```bash
-release_url="https://github.com/vahid162/gre-4/releases/download/v1.0.0"
+release_url="https://github.com/vahid162/gre-4/releases/download/v1.0.1"
 curl -fsSL "$release_url/gre4.sh" -o gre4.sh
 curl -fsSL "$release_url/SHA256SUMS" -o SHA256SUMS
 sha256sum --check SHA256SUMS && sudo bash ./gre4.sh
