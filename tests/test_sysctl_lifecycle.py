@@ -6,9 +6,10 @@ import subprocess
 import tempfile
 import unittest
 
+from profile_fixture import ProfileRuntimeCase
 
-SOURCE = (Path(__file__).resolve().parents[1] / "gre4.sh").read_text()
-FUNCTIONS = SOURCE.rsplit('\nmain "$@"', 1)[0]
+
+from shell_source import FUNCTIONS
 SYSCTL_STUB = r'''#!/usr/bin/env bash
 set -euo pipefail
 write_value() {
@@ -62,13 +63,15 @@ class SysctlLifecycleTests(unittest.TestCase):
         for key, value in self.values.items():
             self.set_value(key, value)
         self.generated = self.root / "apply.sh"
+        self.profiles = self.root / "profiles"
+        self.profiles.mkdir(mode=0o700)
         self.config = self.root / "config with spaces"
         self.config.write_text("ROLE=iran\nSERVICE_PORTS=443\nALLOW_UDP=no\nTUN_IF=GRE\n"
                                "LOCAL_PUBLIC_IP=192.0.2.1\nPEER_PUBLIC_IP=198.51.100.1\n"
                                "IRAN_TUN_CIDR=172.16.1.1/30\nKHAREJ_TUN_CIDR=172.16.1.2/30\n")
         result = subprocess.run(
-            ["bash", "-s", "--", str(self.generated), str(self.state), str(self.sysctls), str(self.config), str(self.ufw)],
-            input=FUNCTIONS + '\nAPPLY_SCRIPT=$1\nSTATE_DIR=$2\nSYSCTL_DIR=$3\nCONF_FILE=$4\nUFW_DIR=$5\nUFW_BEFORE_FILE=$5/before.rules\ninstall_apply_script\n',
+            ["bash", "-s", "--", str(self.generated), str(self.state), str(self.sysctls), str(self.config), str(self.ufw), str(self.profiles), str(self.root / "locks")],
+            input=FUNCTIONS + '\nAPPLY_SCRIPT=$1\nSTATE_DIR=$2\nSYSCTL_DIR=$3\nCONF_FILE=$4\nUFW_DIR=$5\nUFW_BEFORE_FILE=$5/before.rules\nPROFILE_DIR=$6\nLOCK_DIR=$7\ninstall_apply_script\n',
             text=True, capture_output=True, env=self.env, timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -261,8 +264,11 @@ restore_sysctl
         self.assertEqual(self.value("net.ipv4.ip_forward"), "1")
 
     def test_generated_helper_cleans_partial_start_on_stop(self):
+        profile = self.profiles / 'legacy.conf'
+        profile.write_text(self.config.read_text())
+        profile.chmod(0o600)
         for name, script in {
-            "ip": "#!/bin/bash\nexit 1\n",
+            "ip": "#!/bin/bash\nif [[ $* == '-o -4 addr show' ]]; then echo '2: eth0 inet 192.0.2.1/32 scope global eth0'; exit 0; fi\nif [[ $* == '-4 route show table all' || $* == '-o link show' ]]; then exit 0; fi\nexit 1\n",
             "iptables": "#!/bin/bash\nexit 1\n",
             "ufw": "#!/bin/bash\necho 'Status: inactive'\n",
         }.items():
@@ -270,30 +276,34 @@ restore_sysctl
             executable.write_text(script)
             executable.chmod(0o755)
         (self.runtime / "fail.net.ipv4.conf.all.forwarding").touch()
-        result = subprocess.run(["bash", str(self.generated), "start"],
+        result = subprocess.run(["bash", str(self.generated), "start", "legacy"],
                                 capture_output=True, text=True, env=self.env, timeout=5)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.value("net.ipv4.ip_forward"), "1")
         self.assertTrue(self.state.exists())
         (self.runtime / "fail.net.ipv4.conf.all.forwarding").unlink()
-        result = subprocess.run(["bash", str(self.generated), "stop"],
+        result = subprocess.run(["bash", str(self.generated), "stop", "legacy"],
                                 capture_output=True, text=True, env=self.env, timeout=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.config.unlink()
         self.assert_originals()
-        self.assertFalse(self.state.exists())
+        self.assertFalse(list(self.state.glob('profiles/*/applied.conf')))
+        self.assertFalse(list((self.state / 'sysctl').glob('*')))
         self.assertFalse(list(self.sysctls.iterdir()))
 
-    def test_stop_all_runs_sysctl_cleanup_after_other_cleanup_failure(self):
-        self.run_shell("tune_forwarding\n")
-        self.run_shell(r'''
-ip() { [[ $1 != tunnel ]]; }
-iptables() { [[ $3 != -C ]] || return 1; }
-ufw_is_active() { return 1; }
-stop_all
-''', expected=1)
-        self.assert_originals()
-        self.assertFalse(self.state.exists())
+
+class ProfileSysctlCleanupTests(ProfileRuntimeCase):
+    def test_failed_profile_cleanup_keeps_shared_settings_until_retry(self):
+        self.config('iran1')
+        self.invoke('start', 'iran1')
+        self.update(failures=['ip tunnel del g4-iran1'])
+        self.invoke('stop', 'iran1', success=False)
+        self.assertEqual(self.data()['sysctl']['net.ipv4.ip_forward'], '1')
+        self.assertTrue((self.state_dir / 'profiles/iran1/applied.conf').exists())
+        self.update(failures=[])
+        self.invoke('stop', 'iran1')
+        self.assertEqual(self.data()['sysctl']['net.ipv4.ip_forward'], '0')
+        self.assertFalse((self.state_dir / 'profiles/iran1/applied.conf').exists())
 
 
 if __name__ == "__main__":
