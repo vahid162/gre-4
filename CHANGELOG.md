@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- Translate the main README into Persian and keep project release metadata in
+  VERSION and CHANGELOG; use version-free download links with checksum gating.
+- Add repository agent instructions for documentation language, versioning,
+  pull requests, validation, and preservation of existing work.
+
 ## 1.1.0 - 2026-11-04
 
 ### Added

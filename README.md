@@ -1,191 +1,204 @@
-# gre-4
+# راهنمای GRE4
 
-Manage independent GRE tunnels from several Iran gateways to one Kharej
-(outside) Linux server. Each Iran gateway forwards selected TCP ports, with
-optional UDP, to the same port numbers on its own Kharej tunnel address.
+با این اسکریپت می‌توانید چند سرور ایران را با تونل‌های GRE مستقل به یک سرور
+خارج متصل کنید. هر سرور ایران، پورت‌های TCP انتخاب‌شده و در صورت نیاز UDP را
+به همان شمارهٔ پورت روی نشانی تونل مربوط به خودش در سرور خارج هدایت می‌کند.
 
-Version 1.1.0 introduces connection profiles. Older `v1.0.1` installations use
-the single-connection layout and need the explicit migration described below.
+هر اتصال یک «پروفایل» دارد؛ یعنی تنظیمات، رابط شبکه و سرویس آن جدا نگهداری
+می‌شود. افزودن یا حذف یک اتصال، نشانی‌های اتصال‌های دیگر را تغییر نمی‌دهد.
 
-## Requirements
+شمارهٔ جاری پروژه در [فایل VERSION](VERSION) و تاریخچهٔ تغییرات و شرایط دقیق
+ارتقا در [فایل CHANGELOG.md](CHANGELOG.md) ثبت می‌شود.
 
-- Root access on Linux hosts running systemd, with Bash 4 or newer.
-- iproute2 (`ip`), iptables, procps (`sysctl`), util-linux (`flock`), and the
-  usual GNU core utilities.
-- A distinct, static public IPv4 address for each server. The local endpoint
-  must be configured on the local host.
-- GRE **IP protocol 47**, allowed between each endpoint pair by the hosting
-  network and any host firewall. This is a protocol number, not TCP/UDP port 47.
-- UFW is optional. OpenSSH is optional; when installed, its configuration must
-  be readable and valid so cleanup can preserve existing SSH allowances.
-- The application on Kharej must listen on every selected tunnel destination,
-  or on an appropriate wildcard address such as `0.0.0.0`. GRE4 does not edit
-  application listener settings.
+## پیش‌نیازها
 
-The runtime remains one downloadable `gre4.sh`. It generates a shared apply
-helper and a systemd service template; Python is needed only for the tests.
-GRE itself does not provide encryption.
+- دسترسی `root` روی سرورهای لینوکسی دارای systemd و Bash 4 یا جدیدتر.
+- ابزارهای iproute2 شامل `ip`، ابزار iptables، بستهٔ procps شامل `sysctl`،
+  بستهٔ util-linux شامل `flock` و ابزارهای معمول GNU.
+- یک IPv4 عمومی ثابت و مجزا برای هر سرور؛ نشانی محلی واردشده باید واقعاً روی
+  همان سرور تنظیم شده باشد.
+- مجازبودن **پروتکل IP شمارهٔ ۴۷، یعنی GRE**، بین دو سمت در شبکهٔ میزبان و
+  فایروال سرور. این شمارهٔ پروتکل است؛ بازکردن پورت TCP یا UDP شمارهٔ ۴۷ کافی نیست.
+- UFW اختیاری است. OpenSSH نیز اختیاری است؛ اگر نصب باشد، تنظیمات آن باید
+  معتبر و قابل‌خواندن باشد تا پاک‌سازی بتواند مجوزهای دسترسی SSH را حفظ کند.
+- برنامهٔ مقصد روی سرور خارج باید روی نشانی مقصد هر تونل یا، در صورت مناسب‌بودن
+  برای برنامه، نشانی شنود همهٔ رابط‌ها مانند `0.0.0.0` گوش کند. اسکریپت تنظیمات
+  شنود برنامه را تغییر نمی‌دهد.
 
-## Download and verify v1.1.0
+برای اجرا فقط فایل `gre4.sh` لازم است. این فایل، اسکریپت کمکی اعمال تنظیمات
+و قالب سرویس systemd را تولید می‌کند. Python فقط برای تست‌های مخزن لازم است.
+خود GRE ترافیک را رمزنگاری نمی‌کند.
 
-Download the script and checksum from the same
-[v1.1.0 release](https://github.com/vahid162/gre-4/releases/tag/v1.1.0).
-The following commands run the script only if both downloads and checksum
-verification succeed:
+## دانلود، بررسی صحت و اجرا
+
+اسکریپت و فایل checksum را از [صفحهٔ آخرین انتشار](https://github.com/vahid162/gre-4/releases/latest)
+دریافت کنید. دستورهای زیر را روی **هر سرور جداگانه** اجرا کنید:
 
 ```bash
-mkdir -p gre4-v1.1.0 &&
-cd gre4-v1.1.0 &&
-curl -fsSL https://github.com/vahid162/gre-4/releases/download/v1.1.0/gre4.sh -o gre4.sh &&
-curl -fsSL https://github.com/vahid162/gre-4/releases/download/v1.1.0/SHA256SUMS -o SHA256SUMS &&
+mkdir -p gre4-install &&
+cd gre4-install &&
+curl -fsSL https://github.com/vahid162/gre-4/releases/latest/download/gre4.sh -o gre4.sh &&
+curl -fsSL https://github.com/vahid162/gre-4/releases/latest/download/SHA256SUMS -o SHA256SUMS &&
 sha256sum --check SHA256SUMS &&
 sudo bash ./gre4.sh
 ```
 
-Run the script separately on each server. For an existing v1.0.1 installation,
-choose migration before adding any new profiles.
+اتصال دستورها با `&&` باعث می‌شود اسکریپت فقط پس از دانلود موفق هر دو فایل
+و تأیید checksum اجرا شود. خروجی بررسی باید `gre4.sh: OK` باشد. اگر با کاربر
+`root` وارد شده‌اید، در خط آخر از `bash ./gre4.sh` استفاده کنید.
 
-## Run a source revision
+اگر checksum تأیید نشد، اسکریپت را اجرا نکنید. ممکن است انتشار جدیدی بین دو
+دانلود قرار گرفته باشد؛ هر دو فایل را دوباره از **یک صفحهٔ انتشار مشخص**
+دریافت و بررسی کنید.
 
-Use a reviewed checkout of the revision you intend to install:
+اگر نصب تک‌اتصالی روی سرور دارید، پیش از افزودن پروفایل جدید، بخش مهاجرت را
+بخوانید و از گزینهٔ مهاجرت استفاده کنید.
+
+## اجرای کد از مخزن
+
+اگر مخزن را دریافت کرده‌اید، پس از بررسی کدی که قصد نصب آن را دارید، از ریشهٔ
+مخزن اجرا کنید:
 
 ```bash
 sudo bash ./gre4.sh
 ```
 
-To download the current main branch, save the complete file before running it:
+برای دریافت کد شاخهٔ `main` نیز ابتدا دانلود کامل فایل را انجام دهید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vahid162/gre-4/main/gre4.sh -o gre4.sh
+curl -fsSL https://raw.githubusercontent.com/vahid162/gre-4/main/gre4.sh -o gre4.sh &&
 sudo bash ./gre4.sh
 ```
 
-An unmerged feature is available only in its feature branch or checkout.
-Downloading `main` does not download an unmerged PR.
+کد شاخهٔ `main` ممکن است با فایل آخرین انتشار تفاوت داشته باشد. تغییری که هنوز
+ادغام نشده، فقط در شاخهٔ مربوط به خودش موجود است. روش دانلود از انتشار، فایل
+checksum را هم برای بررسی صحت در اختیار شما می‌گذارد.
 
-Published releases provide `gre4.sh` and `SHA256SUMS`. Download both from the
-same release, then verify before running:
+## اتصال چند سرور ایران به یک سرور خارج
 
-```bash
-sha256sum --check SHA256SUMS
-```
+۱. ابتدا روی سرور خارج اسکریپت را اجرا کنید و گزینهٔ **۲** را برای افزودن
+یک همتای ایران انتخاب کنید.
 
-## Set up multiple Iran gateways
+۲. برای اتصال، شناسه‌ای کوتاه و ثابت مانند `iran1` وارد کنید. سپس IPv4 عمومی
+دو سمت، پورت‌های برنامه، انتخاب UDP و زیرشبکهٔ `/30` بدون تداخل را مشخص کنید.
 
-Start on Kharej and add one Iran peer at a time. Give each connection a short,
-stable ID, for example `iran1`, `iran2`, or `iran3`. Enter the public endpoint
-addresses, service ports, UDP choice, and a non-overlapping `/30` tunnel subnet.
-Use the displayed connection summary to enter matching values on its Iran host.
-Configuration is local: GRE4 does not log into or configure another server.
+۳. خلاصهٔ تنظیمات نمایش‌داده‌شده را نگه دارید. روی سرور ایران مربوط به همین
+اتصال، گزینهٔ **۱** را انتخاب و شناسه، زیرشبکه، پورت‌ها و انتخاب UDP را مطابق
+همان خلاصه وارد کنید.
 
-For example, all three gateways can forward `443,2096` to the same application:
+۴. برای سرور ایران بعدی همین مراحل را با شناسه و زیرشبکهٔ جدا تکرار کنید.
+اسکریپت روی هر سرور فقط تنظیمات همان سرور را انجام می‌دهد؛ وارد سرور دیگر نمی‌شود.
 
-| ID | Iran tunnel address | Kharej tunnel address | Subnet |
+برای نمونه، سه سرور ایران می‌توانند پورت‌های `443,2096` را به یک برنامه
+روی سرور خارج هدایت کنند:
+
+| شناسه | نشانی تونل ایران | نشانی تونل خارج | زیرشبکه |
 |---|---|---|---|
 | `iran1` | `172.16.1.1/30` | `172.16.1.2/30` | `172.16.1.0/30` |
 | `iran2` | `172.16.1.5/30` | `172.16.1.6/30` | `172.16.1.4/30` |
 | `iran3` | `172.16.1.9/30` | `172.16.1.10/30` | `172.16.1.8/30` |
 
-These are examples, not reserved address space. Check both hosts for conflicts
-with existing addresses, routes, VPNs, containers, and other GRE4 profiles.
-Default routes are not treated as subnet conflicts. Once assigned, addresses
-stay with a profile; removing another profile does not renumber them.
+این نشانی‌ها صرفاً نمونه‌اند و برای GRE4 رزرو نشده‌اند. در **هر دو سمت**،
+تداخل با نشانی‌ها، مسیرها، شبکه‌های VPN، کانتینرها و پروفایل‌های دیگر را بررسی
+کنید. مسیر پیش‌فرض به‌عنوان تداخل زیرشبکه در نظر گرفته نمی‌شود. پس از ثبت
+تنظیمات، حذف یک پروفایل باعث تغییر نشانی پروفایل‌های دیگر نمی‌شود.
 
-On each Iran server choose the Iran gateway role and enter its corresponding
-profile settings. The Kharej public IP is the same for all Iran gateways; its
-internal tunnel address differs for each connection. Reusing `443` on distinct
-Iran public IPs is supported. Port translation, load balancing, and automatic
-client failover are not provided.
+IPv4 عمومی سرور خارج برای همهٔ اتصال‌ها یکسان است، اما نشانی داخلی تونل آن
+برای هر اتصال متفاوت است. استفاده از پورت یکسان مانند `443` روی IPv4 عمومی
+مجزای سرورهای ایران پشتیبانی می‌شود. تبدیل شمارهٔ پورت، توزیع بار و جابه‌جایی
+خودکار مشتری به مسیر جایگزین در این اسکریپت پیاده‌سازی نشده است.
 
-## Manage a connection
+## مدیریت اتصال‌ها
 
-Select a connection before changing its ports, peer IP, or UDP setting, or
-starting, stopping, restarting, and removing it. Adding or operating one profile
-does not deliberately restart another profile. Actions affect only the local
-server; remove both ends separately when retiring a complete connection.
+پیش از تغییر پورت‌ها، نشانی طرف مقابل، انتخاب UDP، شروع، توقف، راه‌اندازی مجدد
+یا حذف، پروفایل موردنظر را انتخاب کنید. افزودن یا مدیریت یک پروفایل، پروفایل
+دیگر را عمداً راه‌اندازی مجدد نمی‌کند. هر عملیات فقط روی سرور محلی اثر دارد؛
+برای کنارگذاشتن کامل یک اتصال، آن را در هر دو سمت جداگانه حذف کنید.
 
-Changing the local endpoint requires an address already assigned to the host.
-An unassigned address is rejected before stopping the existing connection.
-Per-connection edit locks exclude competing starts while an edit is live and
-are released automatically if the editing process exits or the host reboots.
+برای تغییر نشانی محلی، باید نشانی جدید از قبل روی سرور تنظیم شده باشد. نشانی
+تنظیم‌نشده پیش از توقف اتصال فعال رد می‌شود. قفل ویرایش هر اتصال، شروع هم‌زمان
+آن را هنگام ویرایش مسدود می‌کند؛ با خروج فرایند ویرایش یا راه‌اندازی مجدد
+میزبان، قفل خودکار آزاد می‌شود.
 
-New interfaces are named from the connection ID, and services use instances
-such as `gre4@iran1.service`. Local service state and interface presence do not
-prove that the remote path or application is reachable. Test actual traffic as
-described in [the three-server acceptance guide](docs/three-server-acceptance.md).
+نام رابط‌های جدید از شناسهٔ اتصال ساخته می‌شود و سرویس‌ها نمونه‌هایی مانند
+`gre4@iran1.service` دارند. فعال‌بودن سرویس یا وجود رابط شبکه، به‌تنهایی نشان
+نمی‌دهد برنامهٔ مقصد از راه دور قابل‌دسترسی است؛ ترافیک واقعی را طبق
+[راهنمای آزمون سه‌سروری](docs/three-server-acceptance.md) بررسی کنید.
 
-Profiles are stored privately under `/etc/gre4/profiles/`. Applied snapshots and
-recovery data live under `/var/lib/gre4/`. Cleanup uses the applied snapshot even
-if the editable configuration has changed or is missing. Do not delete recovery
-files to force a failed operation to appear successful.
+تنظیمات خصوصی پروفایل‌ها در `/etc/gre4/profiles/` و وضعیت اعمال‌شده و سوابق
+بازیابی در `/var/lib/gre4/` نگهداری می‌شوند. پاک‌سازی از وضعیت اعمال‌شده استفاده
+می‌کند، حتی اگر فایل تنظیمات قابل‌ویرایش تغییر کرده یا مفقود شده باشد.
+**برای موفق نشان‌دادن یک عملیات ناموفق، فایل‌های بازیابی را حذف نکنید.**
 
-If start or cleanup fails, retain the deployment files and retry the selected
-profile's cleanup. On a 1.1.0 profile installation, if its editable configuration
-is missing, the installed helper can still use the applied snapshot:
+اگر شروع یا پاک‌سازی شکست خورد، فایل‌های نصب را نگه دارید و پاک‌سازی همان
+پروفایل را دوباره انجام دهید. در نصب دارای پروفایل، اگر فایل تنظیمات مفقود
+باشد، helper نصب‌شده همچنان می‌تواند از وضعیت اعمال‌شده استفاده کند:
 
 ```bash
 sudo systemctl stop gre4@iran1.service
 sudo /usr/local/sbin/gre4-apply.sh stop iran1
 ```
 
-Use the affected ID in place of `iran1`; this command form is for the profile
-helper, not the old v1.0.1 singleton helper. Restore a valid configuration before
-starting it again. A cleanup-pending profile cannot be started again until its
-cleanup succeeds. Configuration replacement is atomic; write or permission
-failures preserve the previous configuration.
+به‌جای `iran1` شناسهٔ اتصال آسیب‌دیده را وارد کنید. این شکل دستور مخصوص helper
+دارای پروفایل است و برای helper نصب تک‌اتصالی مناسب نیست. پیش از شروع مجدد،
+فایل تنظیمات معتبر را بازیابی کنید. پروفایل منتظر پاک‌سازی، تا موفقیت پاک‌سازی
+دوباره شروع نمی‌شود. جایگزینی تنظیمات به‌صورت اتمی انجام می‌شود؛ شکست نوشتن
+یا تنظیم مجوزها، فایل تنظیمات قبلی را حفظ می‌کند.
 
-### Firewall and shared settings
+### فایروال و تنظیمات مشترک
 
-Per-profile NAT and forwarding rules carry ownership comments. Cleanup preserves
-untagged administrator rules. Kharej UFW service-port allowances are shared:
-removing one profile keeps a port needed by another. GRE peer allowances are
-restricted to the configured public endpoint pairs. Existing SSH restrictions
-and administrator-owned public allowances are preserved.
+قواعد NAT و عبور ترافیک هر پروفایل، برچسب مالکیت دارند. پاک‌سازی، قواعد بدون
+برچسب متعلق به مدیر سرور را حفظ می‌کند. مجوزهای پورت برنامه در UFW سرور خارج
+مشترک‌اند؛ حذف یک پروفایل، مجوز پورتی را که پروفایل دیگری لازم دارد حذف نمی‌کند.
+مجوزهای GRE به جفت نشانی عمومی تنظیم‌شده محدود می‌شوند. محدودیت‌های قبلی SSH
+و مجوزهای عمومی متعلق به مدیر سرور حفظ می‌شوند.
 
-With inactive UFW, persistent obsolete GRE4 rules can block cleanup. Rules still
-needed by another profile are distinguished from obsolete rules; GRE4 does not
-enable UFW solely for cleanup. Inspect the reported rules and preserve a separate
-management path before correcting the firewall and retrying.
+اگر UFW غیرفعال باشد، قواعد قدیمی و ماندگار GRE4 ممکن است مانع پاک‌سازی شوند.
+قواعد لازم برای پروفایل دیگر از قواعد منسوخ تشخیص داده می‌شوند. اسکریپت صرفاً
+برای پاک‌سازی، UFW را فعال نمی‌کند. پیش از اصلاح فایروال و تلاش مجدد، قواعد
+گزارش‌شده را بررسی کنید و یک راه دسترسی مدیریتی جداگانه را حفظ کنید.
 
-Forwarding and Kharej connection-tracking tuning are host-wide resources. Their
-original values are captured once, remain available to dependent profiles, and
-are restored only after the final dependent cleanup completes. Later
-administrator changes are preserved. Changed shared runtime values, unowned
-files, or administrator-edited sysctl files can require manual review before
-a new start; GRE4 does not silently overwrite them.
+هدایت بسته‌ها و تنظیمات نگهداری وضعیت اتصال‌ها روی سرور خارج، منابع مشترک
+میزبان‌اند. مقدار اولیهٔ آن‌ها یک‌بار ثبت می‌شود و فقط پس از پاک‌سازی آخرین
+پروفایل وابسته بازیابی می‌شود. تغییرات بعدی مدیر سرور حفظ خواهد شد. تغییر
+تنظیمات مشترک در حال اجرا، فایل بدون مالکیت مشخص یا ویرایش فایل sysctl توسط
+مدیر ممکن است پیش از شروع مجدد به بررسی دستی نیاز داشته باشد؛ اسکریپت آن‌ها
+را بدون بررسی بازنویسی نمی‌کند.
 
-## Migrate a v1.0.1 installation
+## مهاجرت نصب تک‌اتصالی
 
-Use the explicit migration menu option, rather than creating a second deployment
-on top of the old singleton service. Migration supports the recognized canonical
-v1.0.1 helper and installation layout. Unknown or modified legacy helpers and
-ambiguous ownership/recovery state are rejected for manual review.
+اگر نصب تک‌اتصالی موجود دارید، به‌جای ایجاد اتصال دوم روی همان نصب، گزینهٔ
+**۶** را برای مهاجرت انتخاب کنید. مهاجرت خودکار فقط برای helper رسمی و ساختار
+نصب شناخته‌شده پشتیبانی می‌شود؛ نصب دقیق پشتیبانی‌شده در
+[یادداشت‌های ارتقای CHANGELOG.md](CHANGELOG.md) مشخص شده است. helper ناشناخته
+یا تغییرکرده و وضعیت مبهم مالکیت یا بازیابی، برای بررسی دستی رد می‌شود.
 
-Migration backs up the old configuration, helper, service, and recovery data in
-a private location. It stops and cleans the old deployment with the verified old
-helper **before replacing it**, then imports the connection as `legacy`, keeping
-its `GRE` interface, public endpoints, tunnel addresses, ports, and UDP setting.
-The old service's active and enabled states are preserved: an intentionally
-stopped or disabled installation is not silently started or enabled.
+ابتدا از تنظیمات، helper، سرویس و اطلاعات بازیابی نصب قبلی در مسیری خصوصی
+پشتیبان گرفته می‌شود. نصب قبلی با helper تأییدشدهٔ خودش متوقف و پاک‌سازی می‌شود؛
+**سپس helper جایگزین می‌شود**. اتصال با شناسهٔ `legacy` وارد می‌شود و رابط
+`GRE`، نشانی‌های عمومی و تونل، پورت‌ها و انتخاب UDP حفظ می‌شوند. وضعیت فعال‌بودن
+و اجرای خودکار سرویس هنگام روشن‌شدن سیستم نیز حفظ می‌شود؛ نصب عمداً متوقف یا
+غیرفعال، خودکار روشن یا فعال نمی‌شود.
 
-Expect a short interruption on the migrated host. Either host can migrate first
-because the original tunnel addresses are retained. The old and new services
-must never manage the tunnel simultaneously.
+مهاجرت ممکن است روی همان سرور قطعی کوتاهی ایجاد کند. به‌دلیل حفظ نشانی‌های
+تونل، می‌توانید هر سمت را زودتر مهاجرت دهید. سرویس قدیمی و جدید نباید هم‌زمان
+مدیریت یک تونل را در اختیار داشته باشند.
 
-Rollback is attempted only after new-profile cleanup succeeds. Incomplete
-cleanup retains the backup and recovery records and reports recovery needed.
-Old recovery backups are not copied over live recovery state. Retain the backup
-after a successful migration until you have completed server acceptance tests.
-After an interrupted migration, repeat the migration option. Recovery stages
-block automatic starts of the imported profile; rollback rechecks cleanup before
-restoring the old helper. Ambiguous older recovery journals require manual
-review and are retained with their backups.
-Older untagged iptables rules, legacy `gre4-ssh-safety` allowances, and sysctl
-files without recovery records still require manual review.
+در صورت نیاز به بازگشت، ابتدا باید پاک‌سازی پروفایل جدید موفق شود. پاک‌سازی
+ناقص، پشتیبان و سوابق بازیابی را نگه می‌دارد و نیاز به بازیابی را گزارش می‌کند.
+پشتیبان قدیمیِ وضعیت بازیابی روی وضعیت زنده کپی نمی‌شود. پس از مهاجرت موفق نیز
+پشتیبان را تا تکمیل آزمون پذیرش سرورها نگه دارید.
 
-## Local checks and server acceptance
+اگر مهاجرت قطع شد، دوباره گزینهٔ مهاجرت را اجرا کنید. مراحل بازیابی، شروع
+خودکار پروفایل واردشده را مسدود می‌کنند. پیش از بازیابی helper قدیمی، پاک‌سازی
+دوباره بررسی می‌شود و بازگردانی نیمه‌تمام جداگانه ادامه پیدا می‌کند. سوابق
+مبهم قدیمی همراه با پشتیبان برای بررسی دستی حفظ می‌شوند. قواعد قدیمی iptables
+بدون برچسب، مجوزهای `gre4-ssh-safety` و فایل‌های sysctl بدون سابقهٔ بازیابی
+همچنان به بررسی دستی نیاز دارند.
 
-From the repository root:
+## بررسی‌های مخزن و آزمون روی سرور
+
+از ریشهٔ مخزن اجرا کنید:
 
 ```bash
 python3 -B -m unittest discover -s tests -v
@@ -193,13 +206,13 @@ bash -n gre4.sh
 shellcheck --severity=warning gre4.sh
 ```
 
-Tests use Python's standard library, Bash, temporary directories, and substitutes
-for networking/systemd commands. They do not configure a real tunnel or modify
-the host firewall/sysctls. Tests also validate the generated helper's Bash syntax
-and ShellCheck warnings when ShellCheck is available. CI installs and requires
-ShellCheck, so helper linting is mandatory there.
+تست‌ها از کتابخانهٔ استاندارد Python، Bash، پوشه‌های موقت و جایگزین فرمان‌های
+شبکه و systemd استفاده می‌کنند؛ تونل واقعی ایجاد نمی‌کنند و فایروال یا sysctl
+میزبان را تغییر نمی‌دهند. نحو Bash اسکریپت کمکی تولیدشده نیز بررسی می‌شود و در
+صورت وجود ShellCheck، هشدارهای آن هم بررسی می‌شوند. در CI، نصب ShellCheck و
+بررسی helper اجباری است.
 
-Passing repository checks is not live GRE/systemd/UFW validation. Before using
-this version for production traffic, run the
-[three-server acceptance guide](docs/three-server-acceptance.md) on disposable
-hosts and record the outcome, including migration and recovery failures.
+موفقیت تست‌های مخزن، تأیید عملکرد واقعی GRE، systemd یا UFW نیست. پیش از عبور
+ترافیک اصلی، [راهنمای آزمون پذیرش سه‌سروری](docs/three-server-acceptance.md)
+را روی سرورهای آزمایشی اجرا کنید و نتیجه، از جمله شکست‌های مهاجرت و بازیابی،
+را ثبت کنید.
