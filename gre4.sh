@@ -454,9 +454,9 @@ profile_write_ufw_block() {
 profile_shared_ssh_ports() {
   local config key value port found=0
   if ! command -v sshd >/dev/null 2>&1; then return 0; fi
-  config=$(sshd -T 2>/dev/null) || { err "Cannot inspect SSH; keeping shared UFW rules."; return 1; }
+  config=$(sshd -T) || { err "Cannot inspect SSH; keeping shared UFW rules."; return 1; }
   while read -r key value _; do
-    case "$key" in port) port=$value ;; listenaddress) port=${value##*:} ;; *) continue ;; esac
+    case "${key,,}" in port) port=$value ;; listenaddress) port=${value##*:} ;; *) continue ;; esac
     validate_port "$port" || return 1
     printf '%s\n' "$((10#$port))"
     found=1
@@ -915,7 +915,7 @@ install_profile_unit() {
 [Unit]
 Description=GRE4 connection %i
 Wants=network-online.target
-After=network-online.target
+After=network-online.target ssh.service ssh.socket
 
 [Service]
 Type=oneshot

@@ -13,6 +13,10 @@
 - Confirm the connection is active after systemd startup commands before
   reporting successful setup, including versions that return success from
   `enable --now` despite a failed start.
+- Accept mixed-case OpenSSH configuration dump directives when detecting SSH
+  ports before removing shared UFW rules; keep invalid or unknown ports blocked.
+- Order GRE startup after the Ubuntu SSH service/socket, so shutdown cleanup
+  can inspect SSH configuration before its runtime directory disappears.
 
 ### Tests
 

@@ -301,10 +301,15 @@ def main():
                 print('Ubuntu ' + args.release + ': real three-VM acceptance passed', flush=True)
             finally:
                 for guest in guests:
-                    try:
-                        guest.ssh('sudo', 'journalctl', '--no-pager', '-u', 'gre4@*', '-u', 'gre4.service', check=False)
-                    except (OSError, subprocess.SubprocessError):
-                        pass
+                    for diagnostic in [
+                        ('sudo', 'sshd', '-T'),
+                        ('sudo', 'ss', '-lntp'),
+                        ('sudo', 'journalctl', '--no-pager', '-u', 'gre4@*', '-u', 'gre4.service'),
+                    ]:
+                        try:
+                            guest.ssh(*diagnostic, check=False, timeout=30)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
                     guest.close()
     except Exception as error:
         record['status'] = 'failed'
