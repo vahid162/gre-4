@@ -4,9 +4,8 @@ Manage independent GRE tunnels from several Iran gateways to one Kharej
 (outside) Linux server. Each Iran gateway forwards selected TCP ports, with
 optional UDP, to the same port numbers on its own Kharej tunnel address.
 
-Version 1.1.0 introduces connection profiles. The published `v1.0.1` release is
-still the earlier single-connection version. No `v1.1.0` release assets are
-available until a maintainer publishes them.
+Version 1.1.0 introduces connection profiles. Older `v1.0.1` installations use
+the single-connection layout and need the explicit migration described below.
 
 ## Requirements
 
@@ -26,6 +25,25 @@ available until a maintainer publishes them.
 The runtime remains one downloadable `gre4.sh`. It generates a shared apply
 helper and a systemd service template; Python is needed only for the tests.
 GRE itself does not provide encryption.
+
+## Download and verify v1.1.0
+
+Download the script and checksum from the same
+[v1.1.0 release](https://github.com/vahid162/gre-4/releases/tag/v1.1.0).
+The following commands run the script only if both downloads and checksum
+verification succeed:
+
+```bash
+mkdir -p gre4-v1.1.0 &&
+cd gre4-v1.1.0 &&
+curl -fsSL https://github.com/vahid162/gre-4/releases/download/v1.1.0/gre4.sh -o gre4.sh &&
+curl -fsSL https://github.com/vahid162/gre-4/releases/download/v1.1.0/SHA256SUMS -o SHA256SUMS &&
+sha256sum --check SHA256SUMS &&
+sudo bash ./gre4.sh
+```
+
+Run the script separately on each server. For an existing v1.0.1 installation,
+choose migration before adding any new profiles.
 
 ## Run a source revision
 
