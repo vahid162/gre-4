@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed
+
+- Set and verify the GRE ownership alias after interface creation, including
+  kernels that ignore the initial netlink alias attribute; retain strict
+  ownership checks during cleanup.
+- Check role-specific commands and prepare Kharej conntrack before changing
+  forwarding, firewall rules, or an existing connection. Keep the same checks
+  in the generated runtime helper without unloading shared kernel modules.
+
+### Tests
+
+- Cover successful interface creation without an alias and preflight failures
+  without changing an existing deployment.
+- Add Ubuntu release coverage and disposable-VM acceptance for actual kernels,
+  systemd, UFW, and multi-peer TCP/UDP traffic. Passing isolated tests alone
+  remains insufficient evidence of live Ubuntu compatibility.
+
 ### Documentation
 
 - Translate the main README into Persian and keep project release metadata in
