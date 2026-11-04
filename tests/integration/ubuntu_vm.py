@@ -142,11 +142,19 @@ class Guest:
             self.process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def ssh(self, *args, check=True, timeout=180):
-        result = subprocess.run(['ssh', '-i', str(self.key), '-p', str(self.port),
-                                 '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
-                                 '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR',
-                                 '-o', 'ConnectTimeout=3', 'acceptance@127.0.0.1', shlex.join(args)],
-                                text=True, capture_output=True, timeout=timeout)
+        try:
+            result = subprocess.run(['ssh', '-i', str(self.key), '-p', str(self.port),
+                                     '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                                     '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR',
+                                     '-o', 'ConnectTimeout=3', 'acceptance@127.0.0.1', shlex.join(args)],
+                                    text=True, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            with (self.output / (self.role + '-commands.log')).open('a') as log:
+                log.write('$ ' + shlex.join(args) + f'\nSSH timed out after {timeout} seconds\n')
+                for output in [error.stdout, error.stderr]:
+                    if output:
+                        log.write(output.decode(errors='replace') if isinstance(output, bytes) else output)
+            raise
         with (self.output / (self.role + '-commands.log')).open('a') as log:
             log.write('$ ' + shlex.join(args) + '\n' + result.stdout + result.stderr)
         if check and result.returncode:
@@ -158,14 +166,23 @@ class Guest:
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(self.role + ' QEMU exited; inspect its log')
-            result = self.ssh('test', '-f', '/var/lib/gre4-acceptance-vm', check=False, timeout=10)
-            if result.returncode == 0:
-                boot = self.ssh('cat', '/proc/sys/kernel/random/boot_id').stdout.strip()
-                if old_boot is None or boot != old_boot:
-                    self.ssh('sudo', 'cloud-init', 'status', '--wait')
-                    return
-            time.sleep(2)
-        raise TimeoutError(self.role + ' did not finish boot/cloud-init')
+            try:
+                result = self.ssh('test', '-f', '/var/lib/gre4-acceptance-vm', check=False,
+                                  timeout=min(10, max(0, deadline - time.monotonic())))
+                if result.returncode == 0:
+                    boot = self.ssh('cat', '/proc/sys/kernel/random/boot_id', check=False,
+                                    timeout=min(10, max(0, deadline - time.monotonic())))
+                    if boot.returncode not in (0, 255):
+                        raise RuntimeError(self.role + ': could not read boot ID\n' + boot.stdout + boot.stderr)
+                    if boot.returncode == 0 and (old_boot is None or boot.stdout.strip() != old_boot):
+                        break
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        else:
+            raise TimeoutError(self.role + ' did not finish boot/cloud-init')
+        self.ssh('sudo', 'cloud-init', 'status', '--wait',
+                 timeout=min(180, max(0, deadline - time.monotonic())))
 
     def install_tests(self):
         self.ssh('sudo', 'mkdir', '-p', '/opt/gre4-acceptance')
