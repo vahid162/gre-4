@@ -944,7 +944,10 @@ profile_start_service() {
   ( load_profile "$1" && profile_preflight ) || return 1
   # Refresh the paired helper/unit so old ExecStopPost cannot bypass preflight protection.
   install_apply_script && install_profile_unit || return
-  systemctl start "gre4@$1.service"
+  if ! systemctl start "gre4@$1.service" || ! systemctl is-active --quiet "gre4@$1.service"; then
+    err "Connection did not become active: $1"
+    return 1
+  fi
 }
 
 profile_stop_service() {
@@ -1044,7 +1047,9 @@ add_profile_interactive() (
   write_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet" || return
   flock -u 8; exec 8>&-
   install_apply_script && install_profile_unit || return
-  if ! systemctl enable --now "gre4@$id.service"; then
+  if ! systemctl enable "gre4@$id.service" ||
+      ! systemctl start "gre4@$id.service" ||
+      ! systemctl is-active --quiet "gre4@$id.service"; then
     err "Connection setup failed; configuration retained. Inspect status and retry Stop before Start."
     return 1
   fi

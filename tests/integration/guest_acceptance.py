@@ -180,8 +180,11 @@ def collision():
 
 def inactive_cleanup():
     run('ufw', '--force', 'disable')
-    assert unit('iran1', 'stop', check=False).returncode != 0
+    # Some systemd versions return zero for stop even when ExecStopPost fails.
+    unit('iran1', 'stop', check=False)
+    run('systemctl', 'is-failed', '--quiet', 'gre4@iran1.service')
     assert Path('/var/lib/gre4/profiles/iran1/cleanup-pending').exists()
+    assert Path('/var/lib/gre4/profiles/iran1/applied.conf').exists()
     traffic('iran2')
     run('ufw', '--force', 'enable')
     run('/usr/local/sbin/gre4-apply.sh', 'stop', 'iran1')

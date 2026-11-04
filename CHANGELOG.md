@@ -10,6 +10,9 @@
 - Check role-specific commands and prepare Kharej conntrack before changing
   forwarding, firewall rules, or an existing connection. Keep the same checks
   in the generated runtime helper without unloading shared kernel modules.
+- Confirm the connection is active after systemd startup commands before
+  reporting successful setup, including versions that return success from
+  `enable --now` despite a failed start.
 
 ### Tests
 

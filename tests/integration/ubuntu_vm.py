@@ -84,8 +84,9 @@ def mac_address(role, interface):
 
 
 def network_config(role):
+    # The initramfs may already have brought up this NIC, making a rename fail.
     ethernets = {'wan0': {'match': {'macaddress': mac_address(role, 1)},
-                          'set-name': 'wan0', 'dhcp4': True, 'dhcp6': False, 'optional': False}}
+                          'dhcp4': True, 'dhcp6': False, 'optional': False}}
     first = {'match': {'macaddress': mac_address(role, 2)}, 'set-name': 'lab0', 'optional': True}
     if role == 'kharej':
         first['addresses'] = ['192.0.2.1/30']

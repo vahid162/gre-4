@@ -33,11 +33,24 @@ class UbuntuAcceptanceSafetyTests(unittest.TestCase):
             with self.subTest(manifest=manifest), self.assertRaises(ValueError):
                 runner.image_checksum(manifest, 'x.img')
 
-    def test_management_network_is_required_for_cloud_init(self):
+    def test_management_network_keeps_boot_name_and_required_dhcp(self):
         for role in ['kharej', 'iran1', 'iran2']:
             wan = runner.network_config(role)['ethernets']['wan0']
+            self.assertNotIn('set-name', wan)
+            self.assertEqual(wan['match'], {'macaddress': runner.mac_address(role, 1)})
             self.assertTrue(wan['dhcp4'])
+            self.assertFalse(wan['dhcp6'])
             self.assertFalse(wan['optional'])
+
+    def test_lab_network_keeps_peer_addresses_and_interface_names(self):
+        for role, addresses in [('kharej', {'lab0': '192.0.2.1/30', 'lab1': '198.51.100.1/30'}),
+                                ('iran1', {'lab0': '192.0.2.2/30'}),
+                                ('iran2', {'lab0': '198.51.100.2/30'})]:
+            ethernets = runner.network_config(role)['ethernets']
+            self.assertEqual(set(ethernets), {'wan0', *addresses})
+            for name, address in addresses.items():
+                self.assertEqual(ethernets[name]['addresses'], [address])
+                self.assertEqual(ethernets[name]['set-name'], name)
 
     def test_guest_macs_do_not_collide(self):
         addresses = [runner.mac_address(role, index) for role in ['kharej', 'iran1', 'iran2']
@@ -147,6 +160,13 @@ class UbuntuReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'boot ID unavailable'):
             vm.ready()
         self.assertEqual(vm.ssh.call_count, 2)
+
+    def test_readiness_rejects_cloud_init_done_with_nonzero_exit(self):
+        vm = self.make_guest([self.result(), self.result(stdout='new-boot\n'),
+                              self.result(2, stdout='status: done\n')])
+        with self.assertRaises(RuntimeError):
+            vm.ready()
+        self.assertEqual(vm.ssh.call_count, 3)
 
     def test_ssh_timeout_records_command_and_partial_output(self):
         vm = runner.Guest.__new__(runner.Guest)

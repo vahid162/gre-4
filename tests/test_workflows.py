@@ -7,9 +7,9 @@ from profile_fixture import ProfileRuntimeCase
 
 
 class AddWorkflowTests(ProfileRuntimeCase):
-    def add(self, role, expected=0):
+    def add(self, role, expected=0, prefix=''):
         local, peer = ('198.51.100.1', '192.0.2.10') if role == 'iran' else ('192.0.2.10', '198.51.100.1')
-        return self.shell(f'''add_profile_interactive {role} <<'ANSWERS'
+        return self.shell(prefix + f'''add_profile_interactive {role} <<'ANSWERS'
 new
 {local}
 {peer}
@@ -73,6 +73,49 @@ ANSWERS
         self.assertFalse((self.state_dir / 'profiles/new').exists())
         self.assertTrue((self.profiles / 'new.conf').is_file())
         self.assert_sibling(before)
+
+    def test_failed_activation_cannot_be_hidden_by_enable_success(self):
+        foreign = {'local': '', 'remote': '', 'alias': 'administrator',
+                   'addresses': [], 'up': True}
+        self.update(interfaces={'g4-new': foreign})
+        # Some systemctl versions report a successful enable even when --now
+        # logs a failed start. Keep the actual failed service state observable.
+        result = self.add('kharej', expected=1, prefix='''systemctl() {
+  if [[ $1 == enable && $2 == --now ]]; then
+    command systemctl "$@" || return 0
+  else
+    command systemctl "$@"
+  fi
+}
+''')
+        self.assertIn('Connection setup failed', result.stdout + result.stderr)
+        self.assertNotIn('Use this matching configuration', result.stdout)
+        self.assertEqual(self.data()['interfaces'], {'g4-new': foreign})
+        self.assertFalse(self.data()['active']['gre4@new.service'])
+        self.assertTrue((self.profiles / 'new.conf').is_file())
+
+    def test_inactive_service_is_not_reported_as_a_successful_add(self):
+        result = self.add('kharej', expected=1, prefix='''systemctl() {
+  if [[ $1 == start ]]; then return 0; fi
+  if [[ $1 == enable ]]; then command systemctl enable "${@: -1}"; return; fi
+  command systemctl "$@"
+}
+''')
+        self.assertIn('Connection setup failed', result.stdout + result.stderr)
+        self.assertNotIn('Use this matching configuration', result.stdout)
+        self.assertEqual(self.data()['interfaces'], {})
+        self.assertTrue((self.profiles / 'new.conf').is_file())
+
+    def test_start_service_verifies_active_state_after_successful_command(self):
+        self.config('new', role='kharej')
+        result = self.shell('''systemctl() {
+  if [[ $1 == start ]]; then return 0; fi
+  command systemctl "$@"
+}
+profile_start_service new
+''', expected=1)
+        self.assertIn('Connection did not become active', result.stdout + result.stderr)
+        self.assertEqual(self.data()['interfaces'], {})
 
 
 class CanonicalMigrationWorkflowTests(ProfileRuntimeCase):
