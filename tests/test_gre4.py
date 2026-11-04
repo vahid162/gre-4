@@ -83,6 +83,7 @@ if install_apply_script; then exit 1; fi
                 ["bash", "-s", "--", scratch],
                 input=(FUNCTIONS + '\n' + apply_functions
                        + '\nCONF_FILE=$1/config\nAPPLY_SCRIPT=$1/installed-apply.sh\nUNIT_FILE=$1/unit\n'
+                       + 'STATE_DIR=$1/state\nSYSCTL_DIR=$1/sysctl\nUFW_DIR=$1/ufw\nUFW_BEFORE_FILE=$UFW_DIR/before.rules\nmkdir -p "$SYSCTL_DIR" "$UFW_DIR"\n'
                        + "printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$APPLY_SCRIPT\"\n"
                        + 'chmod +x "$APPLY_SCRIPT"\necho old-unit > "$UNIT_FILE"\n'
                        + "install_apply_script() { printf '#!/usr/bin/env bash\\n# refreshed cleanup\\nexit 0\\n' > \"$APPLY_SCRIPT\"; chmod +x \"$APPLY_SCRIPT\"; }\n"
@@ -96,8 +97,8 @@ if install_apply_script; then exit 1; fi
         self.run_shell(r'''
 declare -A rules=()
 for p in 80 443; do
-  rules["nat PREROUTING -p tcp --dport $p -j DNAT --to-destination 172.16.1.2:$p"]=1
-  rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport $p -j ACCEPT"]=1
+  rules["nat PREROUTING -p tcp --dport $p -j DNAT --to-destination 172.16.1.2:$p -m comment --comment gre4-managed"]=1
+  rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport $p -j ACCEPT -m comment --comment gre4-managed"]=1
 done
 iptables() {
   local table=$2 op=$3 chain=$4 key
@@ -117,8 +118,8 @@ systemctl() {
     stop) stop_all ;;
     start|restart)
       [[ $1 != restart ]] || stop_all
-      rules["nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443"]=1
-      rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport 443 -j ACCEPT"]=1
+      rules["nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed"]=1
+      rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport 443 -j ACCEPT -m comment --comment gre4-managed"]=1
       ;;
     daemon-reload) : ;;
     *) return 99 ;;
@@ -126,9 +127,9 @@ systemctl() {
 }
 write_conf iran 192.0.2.1 198.51.100.1 80,443 no
 manage_ports_remove <<<80
-[[ ! ${rules["nat PREROUTING -p tcp --dport 80 -j DNAT --to-destination 172.16.1.2:80"]:-} ]]
-[[ ! ${rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport 80 -j ACCEPT"]:-} ]]
-[[ ${rules["nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443"]:-} == 1 ]]
+[[ ! ${rules["nat PREROUTING -p tcp --dport 80 -j DNAT --to-destination 172.16.1.2:80 -m comment --comment gre4-managed"]:-} ]]
+[[ ! ${rules["filter FORWARD -o GRE -p tcp -d 172.16.1.2/32 --dport 80 -j ACCEPT -m comment --comment gre4-managed"]:-} ]]
+[[ ${rules["nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed"]:-} == 1 ]]
 ''')
 
     def test_cleanup_preserves_only_existing_managed_ssh_allows(self):
@@ -404,8 +405,8 @@ if ipt_del_all nat PREROUTING -p tcp --dport 443; then exit 1; fi
         self.run_shell(r'''
 declare -A rules=()
 for proto in tcp udp; do
-  rules["nat PREROUTING -p $proto --dport 443 -j DNAT --to-destination 172.16.1.2:443"]=1
-  rules["filter FORWARD -o GRE -p $proto -d 172.16.1.2/32 --dport 443 -j ACCEPT"]=1
+  rules["nat PREROUTING -p $proto --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed"]=1
+  rules["filter FORWARD -o GRE -p $proto -d 172.16.1.2/32 --dport 443 -j ACCEPT -m comment --comment gre4-managed"]=1
 done
 iptables() {
   local table=$2 op=$3 chain=$4 key
@@ -425,16 +426,16 @@ systemctl() {
     stop) stop_all ;;
     start)
       [[ $ALLOW_UDP == no ]]
-      rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443']=1
+      rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed']=1
       ;;
     *) return 99 ;;
   esac
 }
 write_conf iran 192.0.2.1 198.51.100.1 443 yes
 manage_toggle_udp <<<no
-[[ ! ${rules['nat PREROUTING -p udp --dport 443 -j DNAT --to-destination 172.16.1.2:443']:-} ]]
-[[ ! ${rules['filter FORWARD -o GRE -p udp -d 172.16.1.2/32 --dport 443 -j ACCEPT']:-} ]]
-[[ ${rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443']:-} == 1 ]]
+[[ ! ${rules['nat PREROUTING -p udp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed']:-} ]]
+[[ ! ${rules['filter FORWARD -o GRE -p udp -d 172.16.1.2/32 --dport 443 -j ACCEPT -m comment --comment gre4-managed']:-} ]]
+[[ ${rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed']:-} == 1 ]]
 ''')
 
     def test_upgrade_uses_new_cleanup_before_replacing_config(self):
@@ -468,6 +469,127 @@ before=$(cat "$CONF_FILE")
 systemctl() { return 1; }
 if manage_replace_ports <<<443; then exit 1; fi
 [[ $(cat "$CONF_FILE") == "$before" ]]
+''')
+
+    def test_failed_config_replacement_preserves_original(self):
+        for failure in ('write', 'chmod', 'rename'):
+            with self.subTest(failure=failure):
+                self.run_shell(r'''
+write_conf iran 192.0.2.1 198.51.100.1 443 no
+before=$(cat "$CONF_FILE")
+''' + {
+                    'write': "cat() { printf 'ROLE=broken'; return 1; }\n",
+                    'chmod': 'chmod() { return 1; }\n',
+                    'rename': 'mv() { return 1; }\n',
+                }[failure] + r'''
+if write_conf kharej 192.0.2.2 198.51.100.2 80 yes; then exit 1; fi
+[[ $(command cat "$CONF_FILE") == "$before" ]]
+[[ $(stat -c %a "$CONF_FILE") == 600 ]]
+! compgen -G "${CONF_FILE}.tmp.*"
+''')
+
+    def test_cleanup_preserves_ports_from_listenaddress(self):
+        for address in ('0.0.0.0:2222', '[::]:2222', '[2001:db8::1]:2222'):
+            with self.subTest(address=address):
+                self.run_shell(UFW_STUBS + '\nsshd() { printf \'%s\\n\' \'port 22\' '
+                               + shlex.quote('listenaddress ' + address) + '; }\n' + r'''
+fixture='[ 1] 2222/tcp on eth0 ALLOW IN 203.0.113.10 # gre4-managed
+[ 2] 443/tcp ALLOW IN Anywhere # gre4-managed
+[ 3] 2222/tcp (v6) ALLOW IN 2001:db8::1 # gre4-managed'
+ufw_delete_managed_rules preserve-ssh
+[[ ${commands[*]} == '--force delete 2' ]]
+''')
+
+    def test_invalid_listener_port_keeps_all_managed_rules(self):
+        self.run_shell(UFW_STUBS + r'''
+sshd() { printf '%s\n' 'port 22' 'listenaddress [::]:invalid'; }
+fixture='[ 1] 2222/tcp ALLOW IN Anywhere # gre4-managed'
+if ufw_delete_managed_rules preserve-ssh; then exit 1; fi
+[[ ${#commands[@]} == 0 ]]
+''')
+
+    def test_inactive_ufw_retains_recovery_files_for_owned_rules(self):
+        for filename, marker in (
+            ('user.rules', '# gre4-managed'),
+            ('user6.rules', '# tuple ### comment=677265342d6d616e61676564'),
+            ('before.rules', '# gre4.sh BEGIN\n# gre4.sh END'),
+        ):
+            with self.subTest(filename=filename):
+                self.run_shell(r'''
+ip() { return 1; }
+iptables() { return 1; }
+ufw_is_active() { return 1; }
+ufw() { echo 'Inactive firewall must not be enabled or reloaded' >&2; return 99; }
+systemctl() { source "$CONF_FILE"; [[ $1 == stop ]] && stop_all; }
+write_conf kharej 192.0.2.1 198.51.100.1 443 no
+before=$(cat "$CONF_FILE")
+''' + 'printf \'%s\\n\' ' + shlex.quote(marker)
+                               + ' > "$UFW_DIR/' + filename + '"\n' + r'''
+if update_conf kharej 192.0.2.1 198.51.100.1 80 no; then exit 1; fi
+[[ $(cat "$CONF_FILE") == "$before" ]]
+if remove_everything; then exit 1; fi
+[[ -f $CONF_FILE && -x $APPLY_SCRIPT && -f $UNIT_FILE ]]
+''')
+
+    def test_inactive_ufw_without_owned_rules_can_be_cleaned(self):
+        self.run_shell(r'''
+ip() { return 1; }
+iptables() { return 1; }
+ufw_is_active() { return 1; }
+printf '# administrator-only rules\n' > "$UFW_DIR/user.rules"
+ROLE=iran SERVICE_PORTS=443
+stop_all
+''')
+
+    def test_iptables_cleanup_preserves_unowned_matching_rules(self):
+        self.run_shell(r'''
+declare -A rules=()
+rule='nat POSTROUTING -o GRE -d 172.16.1.2/32 -j MASQUERADE'
+tag=' -m comment --comment gre4-managed'
+rules["$rule"]=administrator
+iptables() {
+  local table=$2 op=$3 chain=$4 key
+  shift 4
+  key="$table $chain $*"
+  case $op in
+    -C) [[ -n ${rules[$key]:-} ]] ;;
+    -A) rules["$key"]=gre4 ;;
+    -D) unset 'rules[$key]' ;;
+    *) return 99 ;;
+  esac
+}
+ipt_add nat POSTROUTING -o GRE -d 172.16.1.2/32 -j MASQUERADE
+[[ ${rules[$rule]} == administrator && ! ${rules["$rule$tag"]:-} ]]
+ipt_del_all nat POSTROUTING -o GRE -d 172.16.1.2/32 -j MASQUERADE
+[[ ${rules[$rule]} == administrator ]]
+rules["$rule$tag"]=gre4
+ip() { return 1; }
+ufw_is_active() { return 1; }
+ROLE=iran SERVICE_PORTS=443
+stop_all
+[[ ${rules[$rule]} == administrator && ! ${rules["$rule$tag"]:-} ]]
+''')
+
+    def test_new_iptables_rules_are_owned_and_idempotent(self):
+        self.run_shell(r'''
+declare -A rules=()
+adds=0
+iptables() {
+  local table=$2 op=$3 chain=$4 key
+  shift 4
+  key="$table $chain $*"
+  case $op in
+    -C) [[ -n ${rules[$key]:-} ]] ;;
+    -A) rules["$key"]=1; adds=$((adds+1)) ;;
+    *) return 99 ;;
+  esac
+}
+ipt_add nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443
+ipt_add nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443
+[[ $adds == 1 && ${#rules[@]} == 1 ]]
+[[ ${rules['nat PREROUTING -p tcp --dport 443 -j DNAT --to-destination 172.16.1.2:443 -m comment --comment gre4-managed']:-} == 1 ]]
+iptables() { return 4; }
+if ipt_add nat PREROUTING -p tcp --dport 80; then exit 1; fi
 ''')
 
 
