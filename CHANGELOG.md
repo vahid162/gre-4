@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.1.0 - 2026-11-04
+
+### Added
+
+- Independent GRE connection profiles for multiple Iran gateways sharing one
+  Kharej server, with stable tunnel subnets and per-profile systemd services.
+- Profile selection, independent lifecycle operations, applied snapshots,
+  serialized management/runtime changes, and retryable cleanup records.
+- Explicit migration of recognized v1.0.1 singleton installations, preserving
+  their addresses and active/enabled service intent with private backups.
+- Multi-profile and migration regression coverage, generated-helper syntax and
+  ShellCheck checks, and a three-server acceptance guide.
+
+### Changed
+
+- Scope NAT/forwarding ownership per profile; reconcile shared Kharej UFW
+  allowances and retain host-wide tuning while another profile needs it.
+- Reject conflicting peers, tunnel subnets, unsafe profile paths, and unowned
+  interface collisions rather than replacing another deployment.
+
+### Upgrade notes
+
+- Interrupted migration rollback blocks new-profile startup and rechecks cleanup
+  before restoring the singleton helper; partial restoration resumes separately.
+- Interrupted edits release their per-profile lock automatically. Unassigned
+  local IPv4 edits are rejected before stopping the working connection.
+- Use explicit migration for an existing singleton deployment; a short outage
+  is possible. Unknown helpers or ambiguous recovery state require manual review.
+- Failed cleanup retains recovery data. Rollback does not overwrite live state
+  or enable competing old/new service owners.
+- This release does not add automatic client failover, load balancing, port
+  translation, or encryption. The Kharej application must accept connections
+  on all configured tunnel destination addresses.
+- Repository checks use isolated substitutes. Live GRE/systemd/UFW acceptance
+  on two Iran hosts and one Kharej host remains a separate deployment gate.
+
 ## 1.0.1 - 2026-11-03
 
 ### Fixed
