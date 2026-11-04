@@ -176,7 +176,7 @@ cmp -s "$APPLY_SCRIPT" "$1/before"
     def test_failed_activation_has_post_stop_cleanup(self):
         self.shell(r'''
 install_profile_unit
-grep -Fxq "ExecStopPost=$APPLY_SCRIPT stop %i" "$TEMPLATE_FILE"
+grep -Fxq "ExecStopPost=$APPLY_SCRIPT post-stop %i" "$TEMPLATE_FILE"
 grep -Fxq "ExecStart=$APPLY_SCRIPT start %i" "$TEMPLATE_FILE"
 ! grep -q '^ExecStop=' "$TEMPLATE_FILE"
 ''')
