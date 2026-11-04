@@ -17,6 +17,9 @@
   ports before removing shared UFW rules; keep invalid or unknown ports blocked.
 - Order GRE startup after the Ubuntu SSH service/socket, so shutdown cleanup
   can inspect SSH configuration before its runtime directory disappears.
+- Normalize SSH dump directive names only in the cleanup child of a verified
+  canonical legacy helper during migration, preserving its original backup,
+  port values, and failure status on newer OpenSSH versions.
 
 ### Tests
 
@@ -28,6 +31,8 @@
 
 ### Documentation
 
+- Document the remaining manual-recovery case when rollback restarts an
+  unchanged legacy helper with retained SSH rules on mixed-case OpenSSH builds.
 - Translate the main README into Persian and keep project release metadata in
   VERSION and CHANGELOG; use version-free download links with checksum gating.
 - Add repository agent instructions for documentation language, versioning,

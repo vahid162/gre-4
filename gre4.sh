@@ -1177,6 +1177,30 @@ legacy_verify_helper() {
   }
 }
 
+legacy_stop_compatible() (
+  legacy_verify_helper || return
+  if type -P sshd >/dev/null 2>&1; then
+    # Older verified helpers expect lowercase keywords from OpenSSH's dump.
+    sshd() {
+      local config line
+      if [[ $# == 1 && $1 == -T ]]; then
+        config=$(command sshd "$@") || return
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          if [[ "$line" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
+            printf '%s%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2],,}" "${BASH_REMATCH[3]}"
+          else
+            printf '%s\n' "$line"
+          fi
+        done <<< "$config"
+      else
+        command sshd "$@"
+      fi
+    }
+    export -f sshd
+  fi
+  "$APPLY_SCRIPT" stop
+)
+
 legacy_verify_effective_unit() {
   local fragment dropins reload
   fragment=$(systemctl show --property=FragmentPath --value gre4.service) || return
@@ -1378,7 +1402,7 @@ migrate_legacy_deployment() (
       err "Legacy installation changed during migration; review backup $backup"; return 1;
     }
     profile_preflight || return 1
-    if ! systemctl stop gre4.service || ! "$APPLY_SCRIPT" stop; then
+    if ! systemctl stop gre4.service || ! legacy_stop_compatible; then
       err "Legacy cleanup failed; original installation retained. Retry migration after recovery. Backup: $backup"
       return 1
     fi
