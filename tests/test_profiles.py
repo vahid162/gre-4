@@ -1,7 +1,10 @@
 """Profile configuration and generated-helper checks never touch host networking."""
 from pathlib import Path
+import os
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 from shell_source import FUNCTIONS
@@ -184,6 +187,62 @@ if profile_runtime_lock; then exit 71; fi
 ''')
 
 class ProfileRuntimeTests(ProfileRuntimeCase):
+    def test_unassigned_local_ip_edit_preserves_the_running_connection(self):
+        self.config('iran1')
+        self.invoke('start', 'iran1')
+        before = self.data()
+        config = (self.profiles / 'iran1.conf').read_bytes()
+        snapshot = (self.state_dir / 'profiles/iran1/applied.conf').read_bytes()
+        self.shell('profile_update iran1 iran 198.51.100.99 192.0.2.10 8443 no 172.16.1.0/30\n', expected=1)
+        after = self.data()
+        for key in ('interfaces', 'iptables', 'ufw_rules', 'sysctl'):
+            self.assertEqual(after[key], before[key])
+        self.assertEqual((self.profiles / 'iran1.conf').read_bytes(), config)
+        self.assertEqual((self.state_dir / 'profiles/iran1/applied.conf').read_bytes(), snapshot)
+        self.invoke('stop', 'iran1')
+
+    def test_killed_editor_releases_start_guard_and_preserves_live_edit_exclusion(self):
+        self.config('iran1')
+        self.invoke('start', 'iran1')
+        self.shell(r'''
+{
+  declare -p PROFILE_DIR STATE_DIR LOCK_DIR SYSCTL_DIR UFW_DIR UFW_BEFORE_FILE UFW_DEFAULTS_FILE TEMPLATE_FILE CONF_FILE LEGACY_CONF_FILE UNIT_FILE LEGACY_UNIT_FILE MIGRATION_BACKUP_DIR APPLY_SCRIPT
+  declare -f
+  cat <<'WRITER'
+profile_stop_service() {
+  touch "$STATE_DIR/editor-ready"
+  sleep 30
+}
+profile_update iran1 iran 198.51.100.1 192.0.2.10 8443 no 172.16.1.0/30
+WRITER
+} > "$1/edit-writer.sh"
+''')
+        writer = subprocess.Popen(['bash', str(self.root / 'edit-writer.sh')],
+                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True)
+        try:
+            ready = self.state_dir / 'editor-ready'
+            deadline = time.monotonic() + 5
+            while not ready.exists() and writer.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), 'editor did not reach the locked service-stop boundary')
+            result = self.invoke('start', 'iran1', success=False)
+            self.assertIn('edit', (result.stdout + result.stderr).lower())
+        finally:
+            if writer.poll() is None:
+                os.killpg(writer.pid, signal.SIGKILL)
+            writer.communicate(timeout=5)
+        self.invoke('stop', 'iran1')
+        self.invoke('start', 'iran1')
+        self.assertIn('g4-iran1', self.data()['interfaces'])
+        self.invoke('stop', 'iran1')
+
+    def test_exited_editor_leaves_no_persistent_start_block(self):
+        self.config('iran1')
+        self.shell('profile_begin_edit iran1\n')
+        self.invoke('start', 'iran1')
+        self.invoke('stop', 'iran1')
+
     def test_removing_another_profile_does_not_renumber_saved_addresses(self):
         self.config('iran1', role='kharej', number=1)
         self.config('iran2', role='kharej', number=2)

@@ -86,6 +86,11 @@ starting, stopping, restarting, and removing it. Adding or operating one profile
 does not deliberately restart another profile. Actions affect only the local
 server; remove both ends separately when retiring a complete connection.
 
+Changing the local endpoint requires an address already assigned to the host.
+An unassigned address is rejected before stopping the existing connection.
+Per-connection edit locks exclude competing starts while an edit is live and
+are released automatically if the editing process exits or the host reboots.
+
 New interfaces are named from the connection ID, and services use instances
 such as `gre4@iran1.service`. Local service state and interface presence do not
 prove that the remote path or application is reachable. Test actual traffic as
@@ -153,6 +158,10 @@ Rollback is attempted only after new-profile cleanup succeeds. Incomplete
 cleanup retains the backup and recovery records and reports recovery needed.
 Old recovery backups are not copied over live recovery state. Retain the backup
 after a successful migration until you have completed server acceptance tests.
+After an interrupted migration, repeat the migration option. Recovery stages
+block automatic starts of the imported profile; rollback rechecks cleanup before
+restoring the old helper. Ambiguous older recovery journals require manual
+review and are retained with their backups.
 Older untagged iptables rules, legacy `gre4-ssh-safety` allowances, and sysctl
 files without recovery records still require manual review.
 

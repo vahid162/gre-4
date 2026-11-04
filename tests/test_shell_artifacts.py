@@ -21,6 +21,7 @@ class ShellArtifactTests(unittest.TestCase):
 PROFILE_DIR=$1/profiles
 STATE_DIR=$1/state
 LOCK_DIR=$1/locks
+MIGRATION_BACKUP_DIR=$1/backups
 CONF_FILE=$1/legacy.conf
 TEMPLATE_FILE=$1/gre4@.service
 APPLY_SCRIPT=$2

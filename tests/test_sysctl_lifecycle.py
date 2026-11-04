@@ -71,7 +71,7 @@ class SysctlLifecycleTests(unittest.TestCase):
                                "IRAN_TUN_CIDR=172.16.1.1/30\nKHAREJ_TUN_CIDR=172.16.1.2/30\n")
         result = subprocess.run(
             ["bash", "-s", "--", str(self.generated), str(self.state), str(self.sysctls), str(self.config), str(self.ufw), str(self.profiles), str(self.root / "locks")],
-            input=FUNCTIONS + '\nAPPLY_SCRIPT=$1\nSTATE_DIR=$2\nSYSCTL_DIR=$3\nCONF_FILE=$4\nUFW_DIR=$5\nUFW_BEFORE_FILE=$5/before.rules\nPROFILE_DIR=$6\nLOCK_DIR=$7\ninstall_apply_script\n',
+            input=FUNCTIONS + '\nAPPLY_SCRIPT=$1\nSTATE_DIR=$2\nSYSCTL_DIR=$3\nCONF_FILE=$4\nUFW_DIR=$5\nUFW_BEFORE_FILE=$5/before.rules\nPROFILE_DIR=$6\nLOCK_DIR=$7\nMIGRATION_BACKUP_DIR=$2/migration-backups\ninstall_apply_script\n',
             text=True, capture_output=True, env=self.env, timeout=5,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

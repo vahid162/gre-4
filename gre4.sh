@@ -186,6 +186,16 @@ load_profile() {
   [[ "$TUN_IF" == "g4-$PROFILE_ID" || ( "$PROFILE_ID" == legacy && "$TUN_IF" == GRE ) ]] || { err "Unexpected tunnel interface for $PROFILE_ID"; return 1; }
 }
 
+check_local_public_ip() {
+  local wanted="$1" addresses
+  validate_ipv4 "$wanted" || return 1
+  wanted=$(number_ipv4 "$(ipv4_number "$wanted")")
+  addresses=$(ip -o -4 addr show) || return
+  if ! awk -v wanted="$wanted" '$3=="inet" {split($4,a,"/"); if(a[1]==wanted) found=1} END {exit !found}' <<< "$addresses"; then
+    err "Local public IP is not assigned on this host: $wanted"; return 1
+  fi
+}
+
 check_host_network_conflicts() {
   local subnet="$1" own_interface="${2:-}" base last address dev lo hi routes addresses
   read -r base last < <(cidr_bounds "$subnet")
@@ -277,6 +287,15 @@ profile_runtime_lock() {
   [[ ! -e "$LOCK_DIR/gre4-runtime.lock" || -O "$LOCK_DIR/gre4-runtime.lock" ]] || return 1
   exec 8>"$LOCK_DIR/gre4-runtime.lock" || return
   flock -w 30 8 || { err "Timed out waiting for another GRE4 runtime operation."; return 1; }
+}
+
+profile_edit_lock() {
+  local id="${1:-}" file
+  validate_profile_id "$id" || return 1
+  file="$LOCK_DIR/gre4-edit-$id.lock"
+  [[ ! -L "$file" && ( ! -e "$file" || -O "$file" ) ]] || return 1
+  exec 7>"$file" || return
+  flock -n 7 || { err "Configuration edit in progress for $id"; return 1; }
 }
 
 profile_state_directory() {
@@ -544,16 +563,12 @@ profile_shared_sysctl() (
 profile_start() (
   local id="${1:-}" state staged
   validate_profile_id "$id" && profile_runtime_lock || return 1
-  [[ ! -e "$STATE_DIR/edits/$id" ]] || { err "Configuration edit in progress for $id"; return 1; }
+  profile_edit_lock "$id" && profile_migration_start_allowed "$id" || return 1
   state="$STATE_DIR/profiles/$id"
   [[ ! -L "$STATE_DIR" && ! -L "$STATE_DIR/profiles" && ! -L "$state" && ! -L "$PROFILE_DIR" ]] || return 1
   [[ ! -e "$state/cleanup-pending" ]] || { err "Cleanup pending for $id; stop it successfully before starting."; return 1; }
   load_profile "$id" || return
-  local addresses
-  addresses=$(ip -o -4 addr show) || return
-  if ! awk -v wanted="$LOCAL_PUBLIC_IP" '$3=="inet" {split($4,a,"/"); if(a[1]==wanted) found=1} END {exit !found}' <<< "$addresses"; then
-    err "Local public IP is not assigned on this host: $LOCAL_PUBLIC_IP"; return 1
-  fi
+  check_local_public_ip "$LOCAL_PUBLIC_IP" || return
   profile_conflicts "$id" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" || return
   check_host_network_conflicts "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" || return
   if [[ -f "$state/applied.conf" ]]; then
@@ -601,8 +616,8 @@ profile_stop() (
 install_apply_script() {
   local staged
   staged=$(mktemp "${APPLY_SCRIPT}.tmp.XXXXXX") || return
-  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\nSTATE_DIR=%q\nSYSCTL_DIR=%q\nUFW_DIR=%q\nUFW_BEFORE_FILE=%q\nPROFILE_DIR=%q\nLOCK_DIR=%q\nUFW_DEFAULTS_FILE=%q\n' \
-    "$STATE_DIR" "$SYSCTL_DIR" "$UFW_DIR" "$UFW_BEFORE_FILE" "$PROFILE_DIR" "$LOCK_DIR" "$UFW_DEFAULTS_FILE" > "$staged"; then
+  if ! printf '#!/usr/bin/env bash\nset -euo pipefail\n\nSTATE_DIR=%q\nSYSCTL_DIR=%q\nUFW_DIR=%q\nUFW_BEFORE_FILE=%q\nPROFILE_DIR=%q\nLOCK_DIR=%q\nUFW_DEFAULTS_FILE=%q\nMIGRATION_BACKUP_DIR=%q\n' \
+    "$STATE_DIR" "$SYSCTL_DIR" "$UFW_DIR" "$UFW_BEFORE_FILE" "$PROFILE_DIR" "$LOCK_DIR" "$UFW_DEFAULTS_FILE" "$MIGRATION_BACKUP_DIR" > "$staged"; then
     rm -f "$staged"; return 1
   fi
   cat >> "$staged" <<'GRE4_RUNTIME' || { rm -f "$staged"; return 1; }
@@ -837,7 +852,7 @@ ufw_has_public_allow() {
 }
 
 GRE4_RUNTIME
-  declare -f validate_ipv4 validate_port normalize_ports_list validate_profile_id private_directory private_config_file ipv4_number number_ipv4 cidr_bounds profile_subnet read_profile_file load_profile check_host_network_conflicts profile_conflicts profile_runtime_lock profile_state_directory profile_interface_owned profile_setup_gre profile_ipt_add profile_ipt_del profile_nat profile_requirements profile_write_ufw_block profile_shared_ssh_ports profile_ufw_reconcile profile_reapply_sysctl profile_shared_sysctl profile_start profile_stop >> "$staged" || { rm -f "$staged"; return 1; }
+  declare -f validate_ipv4 validate_port normalize_ports_list validate_profile_id private_directory private_config_file ipv4_number number_ipv4 cidr_bounds profile_subnet read_profile_file load_profile check_local_public_ip check_host_network_conflicts profile_conflicts profile_runtime_lock profile_edit_lock profile_state_directory profile_interface_owned profile_setup_gre profile_ipt_add profile_ipt_del profile_nat profile_requirements profile_write_ufw_block profile_shared_ssh_ports profile_ufw_reconcile profile_reapply_sysctl profile_shared_sysctl profile_migration_start_allowed legacy_safe_path legacy_owned_file profile_start profile_stop >> "$staged" || { rm -f "$staged"; return 1; }
   cat >> "$staged" <<'GRE4_DISPATCH' || { rm -f "$staged"; return 1; }
 case "${1:-start}" in
   start) [[ $# == 2 ]] || { echo "Usage: $0 {start|stop} <connection-id>"; exit 1; }; profile_start "$2" ;;
@@ -899,18 +914,15 @@ profile_stop_service() {
 profile_begin_edit() {
   validate_profile_id "${1:-}" || return 1
   profile_runtime_lock || return
-  private_directory "$STATE_DIR" && private_directory "$STATE_DIR/edits" || return
-  [[ ! -L "$STATE_DIR/edits/$1" ]] || return 1
-  touch "$STATE_DIR/edits/$1" || return
+  # The kernel releases the per-profile guard after a killed writer or reboot.
+  profile_edit_lock "$1" || return
   flock -u 8; exec 8>&-
 }
 
 profile_end_edit() {
   validate_profile_id "${1:-}" || return 1
-  [[ ! -L "$STATE_DIR" && ! -L "$STATE_DIR/edits" ]] || return 1
-  profile_runtime_lock || return
-  rm -f "$STATE_DIR/edits/$1" || return
-  flock -u 8; exec 8>&-
+  flock -u 7 || return
+  exec 7>&-
 }
 
 profile_update() (
@@ -921,6 +933,7 @@ profile_update() (
   trap 'profile_end_edit "$id"' EXIT
   profile_runtime_lock || return
   render_profile "$id" "$@" >/dev/null || return
+  check_local_public_ip "$2" || return
   flock -u 8; exec 8>&-
   profile_stop_service "$id" || return
   profile_runtime_lock || return
@@ -1162,6 +1175,24 @@ legacy_validate_recovery() {
   done
 }
 
+profile_migration_start_allowed() {
+  [[ "$1" == legacy ]] || return 0
+  local root="${MIGRATION_BACKUP_DIR:-/var/backups/gre4}" backup stage
+  legacy_safe_path "$root" || return 1
+  [[ -e "$root/pending" || -L "$root/pending" ]] || return 0
+  [[ -d "$root" && -O "$root" && $(stat -c %a "$root") == 700 ]] || return 1
+  legacy_owned_file "$root/pending" || return 1
+  read -r backup < "$root/pending" || return
+  [[ "$backup" == "$root"/migration.* && -d "$backup" && -O "$backup" ]] && legacy_safe_path "$backup" || return 1
+  [[ $(stat -c %a "$backup") == 700 ]] || return 1
+  legacy_owned_file "$backup/stage" || return 1
+  read -r stage < "$backup/stage" || return
+  case "$stage" in
+    new-installed|complete) return 0 ;;
+    *) err "Legacy migration recovery blocks profile start. Retry migration before starting legacy."; return 1 ;;
+  esac
+}
+
 migration_set_stage() {
   local staged
   staged=$(mktemp "$1/.stage.XXXXXX") || return
@@ -1186,6 +1217,11 @@ migration_restore_legacy() {
     [[ ! -e "$file" || "$file" == "$PROFILE_DIR/legacy.conf" ]] || { err "Other profiles block legacy rollback."; return 1; }
   done
   systemctl disable gre4@legacy.service || return
+  [[ ! -e "$STATE_DIR/profiles/legacy/applied.conf" && ! -L "$STATE_DIR/profiles/legacy/applied.conf" && ! -e "$STATE_DIR/profiles/legacy/cleanup-pending" && ! -L "$STATE_DIR/profiles/legacy/cleanup-pending" ]] || {
+    err "Live profile recovery state blocks legacy restoration. Backup: $backup"; return 1;
+  }
+  # Publish restoration before replacing any files; retries must not run the old helper as profile cleanup.
+  migration_set_stage "$backup" restoring-legacy || return
   if [[ -e "$PROFILE_DIR/legacy.conf" ]]; then
     legacy_owned_file "$PROFILE_DIR/legacy.conf" && cmp -s "$PROFILE_DIR/legacy.conf" "$backup/profile.conf" || {
       err "Imported profile changed; retaining it for manual recovery."; return 1;
@@ -1265,8 +1301,13 @@ migrate_legacy_deployment() (
     warn "Legacy rollback was already completed. Review it before retrying migration. Backup: $backup"
     return 1
   fi
-  if [[ "$stage" == recovery-needed || "$stage" == rollback-needed ]]; then
-    if [[ "$stage" == recovery-needed ]]; then
+  if [[ "$stage" == recovery-needed || "$stage" == rollback-needed || "$stage" == restoring-legacy ]]; then
+    systemctl disable gre4@legacy.service || return
+    if [[ "$stage" != restoring-legacy ]]; then
+      # Older interrupted rollbacks may already contain the singleton helper; never guess its ownership.
+      legacy_owned_file "$backup/profile.helper" && legacy_owned_file "$APPLY_SCRIPT" && cmp -s "$APPLY_SCRIPT" "$backup/profile.helper" || {
+        err "Cannot verify installed profile helper; retaining recovery state for manual review. Backup: $backup"; return 1;
+      }
       profile_stop_service legacy || { err "New-profile cleanup is still incomplete. Recovery backup: $backup"; return 1; }
       migration_set_stage "$backup" rollback-needed || return
     fi
@@ -1321,10 +1362,12 @@ migrate_legacy_deployment() (
     install_apply_script && install_profile_unit || return
     cp -p "$TEMPLATE_FILE" "$backup/profile.service" || return
   fi
+  cp -p "$APPLY_SCRIPT" "$backup/profile.helper" || return
   if [[ "$was_enabled" == yes ]]; then systemctl enable gre4@legacy.service || return
   else systemctl disable gre4@legacy.service || return; fi
   if [[ "$was_active" == yes ]] && ! profile_start_service legacy; then
     migration_set_stage "$backup" recovery-needed || return
+    systemctl disable gre4@legacy.service || return
     if ! profile_stop_service legacy; then
       err "Imported profile cleanup failed; old service remains disabled. Retry migration for recovery. Backup: $backup"
       return 1

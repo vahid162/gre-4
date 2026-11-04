@@ -22,6 +22,10 @@
 
 ### Upgrade notes
 
+- Interrupted migration rollback blocks new-profile startup and rechecks cleanup
+  before restoring the singleton helper; partial restoration resumes separately.
+- Interrupted edits release their per-profile lock automatically. Unassigned
+  local IPv4 edits are rejected before stopping the working connection.
 - Use explicit migration for an existing singleton deployment; a short outage
   is possible. Unknown helpers or ambiguous recovery state require manual review.
 - Failed cleanup retains recovery data. Rollback does not overwrite live state

@@ -180,6 +180,13 @@ bash -n "$APPLY_SCRIPT"
 grep -Fxq "ExecStart=$APPLY_SCRIPT start %i" "$TEMPLATE_FILE"
 grep -Fxq "ExecStopPost=$APPLY_SCRIPT stop %i" "$TEMPLATE_FILE"
 if bash "$APPLY_SCRIPT" start; then exit 1; fi
+backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'migration.*')
+printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
+chmod 600 "$MIGRATION_BACKUP_DIR/pending"
+migration_set_stage "$backup" recovery-needed
+if bash "$APPLY_SCRIPT" start legacy > "$ROOT/helper-start-output" 2>&1; then exit 1; fi
+grep -Fq 'Legacy migration recovery blocks profile start' "$ROOT/helper-start-output"
+[[ ! -e $STATE_DIR/profiles/legacy/applied.conf ]]
 ''')
 
     def test_unknown_helper_is_rejected_before_service_changes(self):
@@ -327,6 +334,108 @@ if migrate_legacy_deployment; then exit 1; fi
 for directory in "$MIGRATION_BACKUP_DIR" "$MIGRATION_BACKUP_DIR"/migration.*; do
   [[ $(stat -c %a "$directory") == 700 ]]
 done
+''')
+
+    def test_rollback_interruption_blocks_reboot_start_and_recleans_before_restore(self):
+        self.run_migration(r'''
+active=yes enabled=yes
+touch "$ROOT/fail-new-start"
+real_set_stage=$(declare -f migration_set_stage)
+migration_set_stage() {
+  printf '%s\n' "$2" > "$1/stage"
+  chmod 600 "$1/stage"
+  [[ $2 != rollback-needed ]] || exit 77
+}
+if migrate_legacy_deployment; then exit 1; fi
+read -r backup < "$MIGRATION_BACKUP_DIR/pending"
+[[ $(cat "$backup/stage") == rollback-needed ]]
+grep -Fxq 'systemctl disable gre4@legacy.service' "$MIGRATION_TEST_LOG"
+# A fresh shell has no in-memory migration flag, as after reboot.
+export MIGRATION_BACKUP_DIR
+if bash -c "$(declare -f profile_migration_start_allowed legacy_owned_file legacy_safe_path err); profile_migration_start_allowed legacy"; then exit 1; fi
+# Replay a start that raced the interruption; recovery must clean it again.
+touch "$ROOT/live-runtime"
+profile_stop_service() {
+  printf 'replay-cleanup\n' >> "$MIGRATION_TEST_LOG"
+  rm -f "$ROOT/live-runtime"
+}
+saved_systemctl=$(declare -f systemctl)
+eval "${saved_systemctl/systemctl ()/fixture_systemctl ()}"
+systemctl() {
+  if [[ $* == 'start gre4.service' ]]; then [[ ! -e $ROOT/live-runtime ]] || return 98; fi
+  fixture_systemctl "$@"
+}
+eval "$real_set_stage"
+if migrate_legacy_deployment; then exit 1; fi
+[[ ! -e $ROOT/live-runtime && ! -e $MIGRATION_BACKUP_DIR/pending ]]
+grep -Fxq 'replay-cleanup' "$MIGRATION_TEST_LOG"
+grep -Fxq 'systemctl start gre4.service' "$MIGRATION_TEST_LOG"
+''')
+
+    def test_partial_helper_restoration_retry_never_runs_singleton_as_profile_cleanup(self):
+        self.run_migration(r'''
+active=yes enabled=yes
+before=$(sha256sum "$APPLY_SCRIPT")
+touch "$ROOT/fail-new-start"
+real_restore_file=$(declare -f migration_restore_file)
+eval "${real_restore_file/migration_restore_file ()/fixture_restore_file ()}"
+migration_restore_file() {
+  fixture_restore_file "$@" || return
+  [[ $2 != "$APPLY_SCRIPT" ]] || return 1
+}
+if migrate_legacy_deployment; then exit 1; fi
+read -r backup < "$MIGRATION_BACKUP_DIR/pending"
+[[ $(cat "$backup/stage") == restoring-legacy && $(sha256sum "$APPLY_SCRIPT") == "$before" ]]
+if profile_migration_start_allowed legacy; then exit 1; fi
+profile_stop_service() { echo 'unsafe-profile-cleanup' >> "$MIGRATION_TEST_LOG"; return 99; }
+eval "$real_restore_file"
+if migrate_legacy_deployment; then exit 1; fi
+[[ ! -e $MIGRATION_BACKUP_DIR/pending && -f $LEGACY_CONF_FILE && -f $LEGACY_UNIT_FILE ]]
+! grep -Fxq 'unsafe-profile-cleanup' "$MIGRATION_TEST_LOG"
+grep -Fxq 'systemctl start gre4.service' "$MIGRATION_TEST_LOG"
+''')
+
+    def test_ambiguous_old_rollback_journal_preserves_live_recovery(self):
+        self.run_migration(r'''
+active=yes enabled=yes
+touch "$ROOT/fail-new-start" "$ROOT/fail-new-cleanup"
+if migrate_legacy_deployment; then exit 1; fi
+read -r backup < "$MIGRATION_BACKUP_DIR/pending"
+printf 'rollback-needed\n' > "$backup/stage"
+rm "$backup/profile.helper"
+mkdir -p "$STATE_DIR/profiles/legacy"
+echo evidence > "$STATE_DIR/profiles/legacy/applied.conf"
+cp "$backup/gre4-apply.sh" "$APPLY_SCRIPT"
+profile_stop_service() { echo unsafe-cleanup >> "$MIGRATION_TEST_LOG"; return 99; }
+if migrate_legacy_deployment; then exit 1; fi
+[[ $(cat "$STATE_DIR/profiles/legacy/applied.conf") == evidence && -f $MIGRATION_BACKUP_DIR/pending ]]
+! grep -q 'unsafe-cleanup\|systemctl start gre4.service' "$MIGRATION_TEST_LOG"
+''')
+
+    def test_persistent_start_guard_allows_only_safe_migration_stages(self):
+        self.run_migration(r'''
+profile_migration_start_allowed legacy
+mkdir -p "$MIGRATION_BACKUP_DIR/migration.fixture"
+backup=$MIGRATION_BACKUP_DIR/migration.fixture
+chmod 700 "$MIGRATION_BACKUP_DIR" "$backup"
+printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
+chmod 600 "$MIGRATION_BACKUP_DIR/pending"
+for stage in prepared legacy-clean recovery-needed rollback-needed restoring-legacy rolled-back unknown; do
+  migration_set_stage "$backup" "$stage"
+  if profile_migration_start_allowed legacy; then exit 1; fi
+  profile_migration_start_allowed iran1
+done
+for stage in new-installed complete; do
+  migration_set_stage "$backup" "$stage"
+  profile_migration_start_allowed legacy
+done
+mv "$backup/stage" "$backup/real-stage"
+ln -s "$backup/real-stage" "$backup/stage"
+if profile_migration_start_allowed legacy; then exit 1; fi
+rm "$backup/stage"
+echo new-installed > "$backup/stage"
+chmod 666 "$backup/stage"
+if profile_migration_start_allowed legacy; then exit 1; fi
 ''')
 
 

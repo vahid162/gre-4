@@ -126,6 +126,11 @@ application and captures at both ends before attributing the failure.
 - Attempt two management actions from different terminals. They must serialize
   or report a lock conflict without lost configuration or an indefinitely
   waiting systemctl/helper cycle.
+- Try an edit with a valid-format local IPv4 that is not assigned to the host.
+  It must fail before changing the configuration or interrupting current traffic.
+- On disposable hosts, interrupt an editing process while its edit is live.
+  A competing start must be excluded while the editor runs. After the editor
+  dies, stop/start must recover without deleting guard files by hand.
 - Induce a second-profile setup failure using a conflicting unowned interface.
   The interface must not be deleted, and the first profile's traffic must remain.
   Fix the conflict and verify the failed profile can be retried safely.
@@ -154,6 +159,9 @@ retain the separate management path.
 7. After any incomplete cleanup, confirm backups and recovery data remain and
    competing old/new owners are not enabled. Follow the reported recovery path;
    do not copy an old state-tree backup over live recovery state.
+8. For a controlled interruption during rollback, verify a reboot cannot start
+   the imported profile during recovery. Repeating migration must recheck cleanup
+   before restoring the old helper, and resume partial restoration separately.
 
 ## Acceptance record
 

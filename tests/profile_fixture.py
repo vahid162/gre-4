@@ -53,8 +53,8 @@ elif tool == 'sysctl':
         rc = 99
 elif tool == 'ip':
     interfaces = state['interfaces']
-    if args[:2] == ['link', 'add']:
-        name = value_after('name')
+    if args[:2] in (['link', 'add'], ['tunnel', 'add']):
+        name = value_after('name') if args[0] == 'link' else args[2]
         if name in interfaces:
             rc = 2
         else:
@@ -126,27 +126,50 @@ elif tool == 'iptables-save':
 elif tool == 'sshd':
     output = state.get('sshd', 'port 2222\n')
 elif tool == 'systemctl':
-    unit = next((part for part in args if part.startswith('gre4@')), '')
-    profile = unit.removeprefix('gre4@').removesuffix('.service')
+    unit = next((part for part in args if part.startswith('gre4')), '')
+    profile = unit.removeprefix('gre4@').removesuffix('.service') if '@' in unit else ''
     action = args[0]
-    if action in ('start', 'stop', 'restart'):
+    enabled = state.setdefault('enabled', {})
+    active = state.setdefault('active', {})
+    if action in ('enable', 'disable'):
+        enabled[unit] = action == 'enable'
+    dispatch = action if action in ('start', 'stop', 'restart') else (
+        'start' if action == 'enable' and '--now' in args else
+        'stop' if action == 'disable' and '--now' in args else '')
+    if dispatch:
+        state.setdefault('service_events', []).append({
+            'action': dispatch, 'unit': unit, 'interfaces': state['interfaces'],
+            'iptables': state['iptables']})
         temporary = path.with_suffix('.tmp')
         temporary.write_text(json.dumps(state))
         temporary.replace(path)
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
         helper = os.environ['GRE4_FAKE_HELPER']
-        if action in ('stop', 'restart'):
-            rc = subprocess.run(['bash', helper, 'stop', profile]).returncode
-        if not rc and action in ('start', 'restart'):
-            rc = subprocess.run(['bash', helper, 'start', profile]).returncode
+        def invoke(operation):
+            return subprocess.run(['bash', helper, operation] + ([profile] if profile else [])).returncode
+        if dispatch in ('stop', 'restart'):
+            rc = invoke('stop')
+        if not rc and dispatch in ('start', 'restart'):
+            rc = invoke('start')
             if rc:
-                subprocess.run(['bash', helper, 'stop', profile])
+                invoke('stop')  # ExecStopPost also runs after a failed oneshot start.
+        with path.with_suffix('.lock').open('a') as final_lock:
+            fcntl.flock(final_lock, fcntl.LOCK_EX)
+            state = json.loads(path.read_text())
+            state.setdefault('active', {})[unit] = not rc and dispatch != 'stop'
+            path.write_text(json.dumps(state))
         sys.exit(rc)
     elif action in ('daemon-reload', 'enable', 'disable'):
         pass
     elif action == 'is-active':
-        rc = 0 if profile in state['interfaces'] else 3
+        rc = 0 if active.get(unit, False) else 3
+    elif action == 'is-enabled':
+        rc = 0 if enabled.get(unit, False) else 1
+    elif action == 'show':
+        property_name = next((part.split('=', 1)[1] for part in args if part.startswith('--property=')), '')
+        output = {'FragmentPath': os.environ['GRE4_FAKE_LEGACY_UNIT'],
+                  'DropInPaths': '', 'NeedDaemonReload': 'no'}[property_name]
     elif 'status' not in args:
         rc = 99
 elif tool == 'ufw':
@@ -214,9 +237,10 @@ class ProfileRuntimeCase(unittest.TestCase):
         self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', GRE4_FAKE_STATE=str(self.fake))
         self.helper = self.root / 'apply.sh'
         self.env['GRE4_FAKE_HELPER'] = str(self.helper)
+        self.env['GRE4_FAKE_LEGACY_UNIT'] = str(self.root / 'gre4.service')
         self.shell('install_apply_script\n')
 
-    def shell(self, body, expected=0):
+    def shell(self, body, expected=0, timeout=15):
         result = subprocess.run(
             ['bash', '-s', '--', str(self.root)],
             input=FUNCTIONS + r'''
@@ -234,7 +258,7 @@ UNIT_FILE=$1/gre4.service
 LEGACY_UNIT_FILE=$UNIT_FILE
 MIGRATION_BACKUP_DIR=$1/backups
 APPLY_SCRIPT=$1/apply.sh
-''' + body, capture_output=True, text=True, env=self.env, timeout=15,
+''' + body, capture_output=True, text=True, env=self.env, timeout=timeout,
         )
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
