@@ -28,6 +28,7 @@ STATE_DIR=$ROOT/state
 SYSCTL_DIR=$ROOT/sysctl.d
 LOCK_DIR=$ROOT/locks
 MIGRATION_BACKUP_DIR=$ROOT/backups
+RELEASE_STAMP_FILE=$ROOT/release
 mkdir -p "$PROFILE_DIR" "$STATE_DIR" "$SYSCTL_DIR" "$LOCK_DIR"
 chmod 700 "$PROFILE_DIR" "$STATE_DIR"
 cat > "$CONF_FILE" <<'CONF'
@@ -78,7 +79,9 @@ systemctl() {
   case $1 in
     show)
       case $2 in
-        --property=FragmentPath) printf '%s\n' "$LEGACY_UNIT_FILE" ;;
+        --property=FragmentPath)
+          if [[ ${@: -1} == gre4@legacy.service ]]; then printf '%s\n' "$TEMPLATE_FILE"
+          else printf '%s\n' "$LEGACY_UNIT_FILE"; fi ;;
         --property=DropInPaths) [[ ! -e "$ROOT/with-dropin" ]] || echo "$ROOT/override.conf" ;;
         --property=NeedDaemonReload) echo no ;;
         *) return 99 ;;
@@ -300,9 +303,53 @@ migrate_legacy_deployment
 backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'migration.*')
 printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
 chmod 600 "$MIGRATION_BACKUP_DIR/pending"
-before=$(wc -l < "$MIGRATION_TEST_LOG")
+: > "$MIGRATION_TEST_LOG"
 migrate_legacy_deployment
-[[ $(wc -l < "$MIGRATION_TEST_LOG") == "$before" && ! -e $MIGRATION_BACKUP_DIR/pending ]]
+! grep -Eq 'systemctl (stop|start|enable|disable)|install-new|new-start|new-stop' "$MIGRATION_TEST_LOG"
+[[ ! -e $MIGRATION_BACKUP_DIR/pending ]]
+''')
+
+    def test_completed_retry_refuses_changed_artifacts_without_certifying_release(self):
+        for target in ('APPLY_SCRIPT', 'TEMPLATE_FILE', 'PROFILE_DIR/legacy.conf'):
+            with self.subTest(target=target):
+                self.run_migration(r'''
+migrate_legacy_deployment
+backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'migration.*')
+printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
+chmod 600 "$MIGRATION_BACKUP_DIR/pending"
+GRE4_RELEASE_TAG=v1.2.0
+GRE4_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+''' + ('printf "# local edit\n" >> "$PROFILE_DIR/legacy.conf"\n' if '/' in target else 'printf "# local edit\n" >> "$' + target + '"\n') + r'''
+: > "$MIGRATION_TEST_LOG"
+if migrate_legacy_deployment; then exit 70; fi
+[[ -f $MIGRATION_BACKUP_DIR/pending && ! -e $RELEASE_STAMP_FILE ]]
+! grep -Eq 'systemctl (stop|start|enable|disable)|install-new|new-start|new-stop' "$MIGRATION_TEST_LOG"
+''')
+
+    def test_old_completed_retry_does_not_promote_its_runtime_to_selected_release(self):
+        self.run_migration(r'''
+migrate_legacy_deployment
+backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'migration.*')
+printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
+chmod 600 "$MIGRATION_BACKUP_DIR/pending"
+GRE4_RELEASE_TAG=v1.2.0
+GRE4_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+migrate_legacy_deployment
+[[ ! -e $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR/pending ]]
+''')
+
+    def test_release_record_failure_keeps_migration_pending_until_retry(self):
+        self.run_migration(r'''
+GRE4_RELEASE_TAG=v1.2.0
+GRE4_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+real_record=$(declare -f record_installed_release)
+record_installed_release() { return 1; }
+if migrate_legacy_deployment; then exit 70; fi
+backup=$(cat "$MIGRATION_BACKUP_DIR/pending")
+[[ $(cat "$backup/stage") == new-installed && ! -e $RELEASE_STAMP_FILE ]]
+eval "$real_record"
+migrate_legacy_deployment
+[[ -f $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR/pending ]]
 ''')
 
     def test_changed_recovery_targets_are_rejected(self):

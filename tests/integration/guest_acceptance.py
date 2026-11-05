@@ -1,5 +1,6 @@
 """Real production-path checks, permitted only inside marked disposable guests."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import time
 ROOT = Path('/opt/gre4-acceptance')
 MARKER = Path('/var/lib/gre4-acceptance-vm')
 SOURCE = ROOT / 'gre4.sh'
+BASELINE = ROOT / 'v1.1.1-manager.sh'
 PORT = '2096'
 ENDPOINTS = {'kharej': '192.0.2.1', 'iran1': '192.0.2.2', 'iran2': '198.51.100.2'}
 
@@ -23,16 +25,24 @@ def run(*args, check=True, input=None):
                           check=check, timeout=120)
 
 
-def manager(body):
+def manager(body, check=True):
     # Suppress only interactive dispatch; management and runtime commands remain real.
     source = SOURCE.read_text()
     assert source.rstrip().endswith('main "$@"')
-    return run('bash', '-se', input=source.rsplit('\nmain "$@"', 1)[0] + '\n' + body)
+    return run('bash', '-se', input=source.rsplit('\nmain "$@"', 1)[0] + '\n' + body, check=check)
+
+
+def release_command():
+    # PR acceptance runs this exact candidate without downloading a prior public release.
+    # The network/checksum bootstrap is covered separately with hermetic HTTP substitutes.
+    return ['bash', str(SOURCE), '--gre4-release', 'v' + (ROOT / 'VERSION').read_text().strip(),
+            hashlib.sha256(SOURCE.read_bytes()).hexdigest()]
 
 
 def menu(role, profile, local, peer, subnet, udp='yes', success=True):
     choice = '2' if role == 'kharej' else '1'
-    result = run('bash', str(SOURCE), input='\n'.join(
+    command = ['bash', str(SOURCE)] if SOURCE == BASELINE else release_command()
+    result = run(*command, input='\n'.join(
         [choice, profile, local, peer, PORT, udp, subnet, '']), check=False)
     assert (result.returncode == 0) == success, result.stdout + result.stderr
 
@@ -214,6 +224,7 @@ def legacy_setup(role):
     assert role in ['kharej', 'iran1']
     assert not list(Path('/etc/gre4/profiles').glob('*.conf'))
     assert not list(Path('/var/lib/gre4/profiles').glob('*/applied.conf'))
+    Path('/var/lib/gre4-release').unlink(missing_ok=True)
     template = Path('/etc/systemd/system/gre4@.service')
     template.unlink(missing_ok=True)
     shutil.copyfile(ROOT / 'v1.0.1-apply.sh', '/usr/local/sbin/gre4-apply.sh')
@@ -237,7 +248,8 @@ def legacy_setup(role):
 
 
 def migrate():
-    run('bash', str(SOURCE), input='6\n')
+    # The verified release entry now imports a recognized singleton before its menu.
+    run(*release_command(), input='4\n')
     run('systemctl', 'is-active', '--quiet', 'gre4@legacy.service')
     run('systemctl', 'is-enabled', '--quiet', 'gre4@legacy.service')
     assert not Path('/etc/gre4.conf').exists()
@@ -248,10 +260,144 @@ def migrate():
     assert_admin_rules()
 
 
+def upgrade(role):
+    configs = {path.name: path.read_bytes() for path in Path('/etc/gre4/profiles').glob('*.conf')}
+    helper = Path('/usr/local/sbin/gre4-apply.sh')
+    template = Path('/etc/systemd/system/gre4@.service')
+    old_helper, old_template = helper.read_bytes(), template.read_bytes()
+    if role == 'kharej':
+        unit('iran2', 'stop')
+        unit('iran2', 'disable')
+
+    def identity():
+        service = run('systemctl', 'show', '--property=InvocationID', '--value',
+                      'gre4@iran1.service').stdout.strip()
+        link = json.loads(run('ip', '-j', 'link', 'show', 'dev', 'g4-iran1').stdout)[0]['ifindex']
+        return service, link
+
+    def preserved():
+        assert configs == {path.name: path.read_bytes()
+                           for path in Path('/etc/gre4/profiles').glob('*.conf')}
+        run('systemctl', 'is-active', '--quiet', 'gre4@iran1.service')
+        run('systemctl', 'is-enabled', '--quiet', 'gre4@iran1.service')
+        if role == 'kharej':
+            assert unit('iran2', 'is-active', check=False).returncode != 0
+            assert unit('iran2', 'is-enabled', check=False).returncode != 0
+        assert_admin_rules()
+
+    before = identity()
+    helper.write_bytes(old_helper + b'\n# disposable local customization\n')
+    try:
+        result = run(*release_command(), input='4\n', check=False)
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert identity() == before
+        preserved()
+    finally:
+        helper.write_bytes(old_helper)
+
+    # Exercise a failed real systemd/GRE start and the actual rollback, only in this VM.
+    if role == 'kharej':
+        real_ip = shutil.which('ip')
+        wrapper = Path('/usr/local/sbin/ip')
+        fault = ROOT / 'fail-next-gre-add'
+        assert real_ip and not wrapper.exists()
+        wrapper.write_text('#!/bin/sh\n'
+                           'if [ "$1 $2 $3 $4" = "link add name g4-iran1" ] && '
+                           '[ -f ' + shlex.quote(str(fault)) + ' ]; then\n'
+                           '  rm -f ' + shlex.quote(str(fault)) + '\n  exit 1\nfi\n'
+                           'exec ' + shlex.quote(real_ip) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        fault.touch()
+        try:
+            assert run('bash', '-c', 'command -v ip').stdout.strip() == str(wrapper)
+            result = run(*release_command(), input='4\n', check=False)
+            assert result.returncode != 0, result.stdout + result.stderr
+            assert not fault.exists(), 'GRE start fault was not exercised'
+            assert helper.read_bytes() == old_helper
+            assert template.read_bytes() == old_template
+            preserved()
+            traffic('iran1')
+        finally:
+            wrapper.unlink()
+            fault.unlink(missing_ok=True)
+
+    run(*release_command(), input='4\n')
+    preserved()
+    stamp = Path('/var/lib/gre4-release').read_bytes()
+    assert stamp
+    before = identity()
+    backups = sorted(str(path) for path in Path('/var/backups/gre4').glob('upgrade.*'))
+    run(*release_command(), input='4\n')
+    assert identity() == before, 'Same-release invocation restarted an active connection'
+    assert Path('/var/lib/gre4-release').read_bytes() == stamp
+    assert sorted(str(path) for path in Path('/var/backups/gre4').glob('upgrade.*')) == backups
+    preserved()
+    check(role, ['iran1'])
+
+
+def interrupted_upgrade():
+    unit('iran2', 'stop')
+    unit('iran2', 'disable')
+    tag = 'v' + (ROOT / 'VERSION').read_text().strip()
+    digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+    result = manager(r'''
+eval "$(declare -f migration_set_stage | sed '1s/migration_set_stage/acceptance_set_stage/')"
+migration_set_stage() {
+  acceptance_set_stage "$@" || return
+  if [[ $2 == old-clean ]]; then kill -KILL "$BASHPID"; fi
+}
+automatic_upgrade ''' + shlex.quote(tag) + ' ' + shlex.quote(digest) + '\n', check=False)
+    assert result.returncode == 137, result.stdout + result.stderr
+    backup = pending_upgrade()
+    assert (backup / 'stage').read_text().strip() == 'old-clean'
+    assert_interrupted_upgrade(backup)
+
+
+def pending_upgrade():
+    backup = Path('/var/backups/gre4/upgrade-pending').read_text().strip()
+    assert Path(backup).parent == Path('/var/backups/gre4')
+    assert Path(backup).name.startswith('upgrade.')
+    return Path(backup)
+
+
+def assert_interrupted_upgrade(backup):
+    assert (backup / 'stage').read_text().strip() == 'old-clean'
+    assert Path('/usr/local/sbin/gre4-apply.sh').read_bytes() == (backup / 'gre4-apply.sh').read_bytes()
+    assert Path('/etc/systemd/system/gre4@.service').read_bytes() == (backup / 'gre4@.service').read_bytes()
+    assert {p.name: p.read_bytes() for p in Path('/etc/gre4/profiles').glob('*.conf')} == {
+        p.name: p.read_bytes() for p in (backup / 'profiles').glob('*.conf')}
+    for profile in ['iran1', 'iran2']:
+        assert unit(profile, 'is-enabled', check=False).stdout.strip() == 'masked'
+        assert unit(profile, 'is-active', check=False).returncode != 0
+        assert run('ip', 'link', 'show', 'dev', 'g4-' + profile, check=False).returncode != 0
+        assert not Path('/var/lib/gre4/profiles/' + profile + '/applied.conf').exists()
+    assert_admin_rules()
+
+
+def recover_interrupted_upgrade():
+    # Called after a real reboot: persistent masks must survive, then a verified
+    # old-clean transaction can be restored using the same guarded rollback.
+    backup = pending_upgrade()
+    assert_interrupted_upgrade(backup)
+    result = run(*release_command(), input='4\n', check=False)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert_interrupted_upgrade(backup)
+    manager('upgrade_rollback ' + shlex.quote(str(backup)) + '\n')
+    assert not Path('/var/backups/gre4/upgrade-pending').exists()
+    check('kharej', ['iran1'])
+    run('systemctl', 'is-enabled', '--quiet', 'gre4@iran1.service')
+    assert unit('iran2', 'is-active', check=False).returncode != 0
+    assert unit('iran2', 'is-enabled', check=False).stdout.strip() == 'disabled'
+    traffic('iran1')
+
+
 def main():
+    global SOURCE
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['versions', 'setup', 'check', 'traffic', 'collision',
-                        'inactive-cleanup', 'remove', 'clean', 'legacy-setup', 'migrate'])
+                        'inactive-cleanup', 'remove', 'clean', 'legacy-setup', 'migrate', 'upgrade',
+                        'upgrade-interrupt', 'upgrade-recover'])
+    parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--role', choices=list(ENDPOINTS), default='kharej')
     parser.add_argument('--firewall', choices=['inactive', 'active-v4', 'active-dual'], default='inactive')
     parser.add_argument('--peer', choices=['both', 'iran1', 'iran2'], default='both')
@@ -259,6 +405,11 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0 or not MARKER.is_file():
         parser.error('Refusing to run outside a disposable cloud-init acceptance guest')
+    if args.baseline:
+        assert args.action == 'setup'
+        assert hashlib.sha256(BASELINE.read_bytes()).hexdigest() == '796b8a78b29d94509cc0ba9e8e18006b6a043fc010d1625e917a4b4196f07f7f'
+        SOURCE = BASELINE
+        Path('/var/lib/gre4-release').unlink(missing_ok=True)
     if args.action == 'versions':
         print(json.dumps(versions(), indent=2))
     elif args.action == 'setup':
@@ -281,6 +432,14 @@ def main():
         legacy_setup(args.role)
     elif args.action == 'migrate':
         migrate()
+    elif args.action == 'upgrade':
+        upgrade(args.role)
+    elif args.action == 'upgrade-interrupt':
+        assert args.role == 'kharej'
+        interrupted_upgrade()
+    elif args.action == 'upgrade-recover':
+        assert args.role == 'kharej'
+        recover_interrupted_upgrade()
 
 
 if __name__ == '__main__':

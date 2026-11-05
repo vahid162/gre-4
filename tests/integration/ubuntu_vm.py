@@ -23,7 +23,8 @@ import urllib.request
 RELEASES = {'22.04': 'jammy', '24.04': 'noble', '26.04': 'resolute', '26.10': 'stonking'}
 REPO = Path(__file__).resolve().parents[2]
 GUEST_FILES = [REPO / 'gre4.sh', Path(__file__).with_name('guest_acceptance.py'),
-               Path(__file__).with_name('echo_server.py'), REPO / 'tests/fixtures/v1.0.1-apply.sh']
+               Path(__file__).with_name('echo_server.py'), REPO / 'tests/fixtures/v1.0.1-apply.sh',
+               REPO / 'tests/fixtures/v1.1.1-manager.sh', REPO / 'VERSION']
 
 
 def command(*args, **kwargs):
@@ -256,6 +257,22 @@ def acceptance(guests, record):
         for guest in guests:
             guest.check('clean')
         record.setdefault('passed', []).append(firewall + ': TCP/UDP, independent profiles, failure/retry, cleanup')
+    record['phase'] = 'profile-auto-upgrade'
+    for guest in guests:
+        guest.check('setup', '--firewall', 'active-dual', '--baseline')
+    outside.check('traffic')
+    outside.check('upgrade-interrupt')
+    outside.reboot()
+    outside.check('upgrade-recover')
+    outside.check('upgrade')
+    outside.check('traffic', '--peer', 'iran1')
+    outside.ssh('sudo', 'systemctl', 'enable', '--now', 'gre4@iran2.service')
+    outside.check('traffic')
+    first.check('upgrade')
+    outside.check('traffic')
+    for guest in guests:
+        guest.check('clean')
+    record['passed'].append('canonical profile auto-upgrade: interrupted cutover/reboot, old-peer traffic, rollback, intent, unknown refusal, no-op')
     record['phase'] = 'canonical-migration'
     for guest in [outside, first]:
         guest.check('legacy-setup')
