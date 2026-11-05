@@ -42,15 +42,17 @@ class UbuntuAcceptanceSafetyTests(unittest.TestCase):
             self.assertFalse(wan['dhcp6'])
             self.assertFalse(wan['optional'])
 
-    def test_lab_network_keeps_peer_addresses_and_interface_names(self):
+    def test_lab_network_keeps_mac_identity_and_peer_addresses(self):
         for role, addresses in [('kharej', {'lab0': '192.0.2.1/30', 'lab1': '198.51.100.1/30'}),
                                 ('iran1', {'lab0': '192.0.2.2/30'}),
                                 ('iran2', {'lab0': '198.51.100.2/30'})]:
             ethernets = runner.network_config(role)['ethernets']
             self.assertEqual(set(ethernets), {'wan0', *addresses})
-            for name, address in addresses.items():
+            for index, (name, address) in enumerate(addresses.items(), start=2):
                 self.assertEqual(ethernets[name]['addresses'], [address])
-                self.assertEqual(ethernets[name]['set-name'], name)
+                self.assertEqual(ethernets[name]['match'], {'macaddress': runner.mac_address(role, index)})
+                self.assertNotIn('set-name', ethernets[name])
+                self.assertTrue(ethernets[name]['optional'])
 
     def test_guest_macs_do_not_collide(self):
         addresses = [runner.mac_address(role, index) for role in ['kharej', 'iran1', 'iran2']

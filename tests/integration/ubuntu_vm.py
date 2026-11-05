@@ -84,13 +84,13 @@ def mac_address(role, interface):
 
 
 def network_config(role):
-    # The initramfs may already have brought up this NIC, making a rename fail.
+    # Keep boot interface names to avoid cloud-init rename races.
     ethernets = {'wan0': {'match': {'macaddress': mac_address(role, 1)},
                           'dhcp4': True, 'dhcp6': False, 'optional': False}}
-    first = {'match': {'macaddress': mac_address(role, 2)}, 'set-name': 'lab0', 'optional': True}
+    first = {'match': {'macaddress': mac_address(role, 2)}, 'optional': True}
     if role == 'kharej':
         first['addresses'] = ['192.0.2.1/30']
-        ethernets['lab1'] = {'match': {'macaddress': mac_address(role, 3)}, 'set-name': 'lab1',
+        ethernets['lab1'] = {'match': {'macaddress': mac_address(role, 3)},
                              'addresses': ['198.51.100.1/30'], 'optional': True}
     elif role == 'iran1':
         first['addresses'] = ['192.0.2.2/30']

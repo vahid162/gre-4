@@ -32,6 +32,8 @@
   remains insufficient evidence of live Ubuntu compatibility.
 - Retry SSH transport failures while waiting for cloud-init after a VM reboot,
   without accepting cloud-init failure statuses or retrying mutating commands.
+- Match disposable VM network interfaces by MAC without forcing a rename during
+  boot; retain the same test addresses and routes.
 
 ### Documentation
 
@@ -61,6 +63,8 @@
   مناسب مدیریت یا مهاجرت به‌روزرسانی می‌شود.
 - انتظار آماده‌شدن ماشین آزمایشی پس از بوت، خطای گذرای ارتباط SSH را دوباره
   بررسی می‌کند؛ خطای واقعی cloud-init همچنان باعث شکست تست می‌شود.
+- کارت‌های شبکهٔ ماشین آزمایشی با MAC تطبیق داده می‌شوند و تغییر نام اجباری
+  هنگام بوت ندارند؛ آدرس‌ها و مسیرهای آزمایش حفظ می‌شوند.
 
 ## 1.1.0 - 2026-11-04
 
