@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-11-05
+
 ### Fixed
 
 - Set and verify the GRE ownership alias after interface creation, including
@@ -28,15 +30,41 @@
 - Add Ubuntu release coverage and disposable-VM acceptance for actual kernels,
   systemd, UFW, and multi-peer TCP/UDP traffic. Passing isolated tests alone
   remains insufficient evidence of live Ubuntu compatibility.
+- Retry SSH transport failures while waiting for cloud-init after a VM reboot,
+  without accepting cloud-init failure statuses or retrying mutating commands.
+- Match disposable VM network interfaces by MAC without forcing a rename during
+  boot; retain the same test addresses and routes.
 
 ### Documentation
 
+- Require a new release for every completed change, including documentation,
+  CI, and repository rules; publish verified script/checksum assets after CI.
+- Clarify that downloading and running main opens the menu; existing deployments
+  require the appropriate management or migration action to apply an update.
 - Document the remaining manual-recovery case when rollback restarts an
   unchanged legacy helper with retained SSH rules on mixed-case OpenSSH builds.
 - Translate the main README into Persian and keep project release metadata in
   VERSION and CHANGELOG; use version-free download links with checksum gating.
 - Add repository agent instructions for documentation language, versioning,
   pull requests, validation, and preservation of existing work.
+
+### فارسی
+
+- نشان مالکیت تونل صریح ثبت و بررسی می‌شود و پیش‌نیازهای conntrack و فایروال
+  پیش از تغییر اتصال فعال بررسی می‌شوند.
+- گزارش موفقیت systemd، ترتیب پاک‌سازی هنگام خاموش‌شدن و سازگاری با قالب جدید
+  خروجی OpenSSH، از جمله پاک‌سازی در مهاجرت نصب رسمی قدیمی، اصلاح شده‌اند.
+- آزمون‌های واقعی سه ماشین مجازی برای Ubuntu 22.04، 24.04، 26.04 و 26.10،
+  ترافیک TCP/UDP، UFW، بوت و مهاجرت را پوشش می‌دهند. نتیجه به محیط ثبت‌شده
+  محدود است؛ در بعضی حالت‌های شکست مهاجرت، بازگشت به helper قدیمی همچنان
+  ممکن است بازیابی دستی بخواهد و بکاپ و رکوردهای بازیابی حفظ می‌شوند.
+- هر مجموعهٔ تغییر، حتی مستندات و قوانین، باید در یک Release جدید عرضه شود.
+  دریافت و اجرای اسکریپت فقط منو را باز می‌کند؛ نصب موجود با انتخاب عملیات
+  مناسب مدیریت یا مهاجرت به‌روزرسانی می‌شود.
+- انتظار آماده‌شدن ماشین آزمایشی پس از بوت، خطای گذرای ارتباط SSH را دوباره
+  بررسی می‌کند؛ خطای واقعی cloud-init همچنان باعث شکست تست می‌شود.
+- کارت‌های شبکهٔ ماشین آزمایشی با MAC تطبیق داده می‌شوند و تغییر نام اجباری
+  هنگام بوت ندارند؛ آدرس‌ها و مسیرهای آزمایش حفظ می‌شوند.
 
 ## 1.1.0 - 2026-11-04
 

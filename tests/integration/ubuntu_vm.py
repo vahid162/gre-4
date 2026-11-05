@@ -84,13 +84,13 @@ def mac_address(role, interface):
 
 
 def network_config(role):
-    # The initramfs may already have brought up this NIC, making a rename fail.
+    # Keep boot interface names to avoid cloud-init rename races.
     ethernets = {'wan0': {'match': {'macaddress': mac_address(role, 1)},
                           'dhcp4': True, 'dhcp6': False, 'optional': False}}
-    first = {'match': {'macaddress': mac_address(role, 2)}, 'set-name': 'lab0', 'optional': True}
+    first = {'match': {'macaddress': mac_address(role, 2)}, 'optional': True}
     if role == 'kharej':
         first['addresses'] = ['192.0.2.1/30']
-        ethernets['lab1'] = {'match': {'macaddress': mac_address(role, 3)}, 'set-name': 'lab1',
+        ethernets['lab1'] = {'match': {'macaddress': mac_address(role, 3)},
                              'addresses': ['198.51.100.1/30'], 'optional': True}
     elif role == 'iran1':
         first['addresses'] = ['192.0.2.2/30']
@@ -182,8 +182,17 @@ class Guest:
             time.sleep(min(2, max(0, deadline - time.monotonic())))
         else:
             raise TimeoutError(self.role + ' did not finish boot/cloud-init')
-        self.ssh('sudo', 'cloud-init', 'status', '--wait',
-                 timeout=min(180, max(0, deadline - time.monotonic())))
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise RuntimeError(self.role + ' QEMU exited; inspect its log')
+            result = self.ssh('sudo', 'cloud-init', 'status', '--wait', check=False,
+                              timeout=min(180, max(0, deadline - time.monotonic())))
+            if result.returncode == 0:
+                return
+            if result.returncode != 255:
+                raise RuntimeError(self.role + ': sudo cloud-init status --wait\n' + result.stdout + result.stderr)
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        raise TimeoutError(self.role + ' did not finish boot/cloud-init')
 
     def install_tests(self):
         self.ssh('sudo', 'mkdir', '-p', '/opt/gre4-acceptance')

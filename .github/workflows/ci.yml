@@ -65,3 +65,21 @@ jobs:
           name: ubuntu-${{ matrix.ubuntu }}-acceptance
           path: dist/ubuntu-${{ matrix.ubuntu }}/
           if-no-files-found: error
+
+  release:
+    name: Publish verified release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, ubuntu-vm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Publish script and checksum from the tested commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -B tools/release.py
