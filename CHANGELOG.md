@@ -2,8 +2,37 @@
 
 ## Unreleased
 
+### Fixed
+
+- Set and verify the GRE ownership alias after interface creation, including
+  kernels that ignore the initial netlink alias attribute; retain strict
+  ownership checks during cleanup.
+- Check role-specific commands and prepare Kharej conntrack before changing
+  forwarding, firewall rules, or an existing connection. Keep the same checks
+  in the generated runtime helper without unloading shared kernel modules.
+- Confirm the connection is active after systemd startup commands before
+  reporting successful setup, including versions that return success from
+  `enable --now` despite a failed start.
+- Accept mixed-case OpenSSH configuration dump directives when detecting SSH
+  ports before removing shared UFW rules; keep invalid or unknown ports blocked.
+- Order GRE startup after the Ubuntu SSH service/socket, so shutdown cleanup
+  can inspect SSH configuration before its runtime directory disappears.
+- Normalize SSH dump directive names only in the cleanup child of a verified
+  canonical legacy helper during migration, preserving its original backup,
+  port values, and failure status on newer OpenSSH versions.
+
+### Tests
+
+- Cover successful interface creation without an alias and preflight failures
+  without changing an existing deployment.
+- Add Ubuntu release coverage and disposable-VM acceptance for actual kernels,
+  systemd, UFW, and multi-peer TCP/UDP traffic. Passing isolated tests alone
+  remains insufficient evidence of live Ubuntu compatibility.
+
 ### Documentation
 
+- Document the remaining manual-recovery case when rollback restarts an
+  unchanged legacy helper with retained SSH rules on mixed-case OpenSSH builds.
 - Translate the main README into Persian and keep project release metadata in
   VERSION and CHANGELOG; use version-free download links with checksum gating.
 - Add repository agent instructions for documentation language, versioning,

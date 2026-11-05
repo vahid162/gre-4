@@ -3,22 +3,65 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    name: Ubuntu ${{ matrix.ubuntu }} userspace
+    runs-on: ubuntu-24.04
+    container: ubuntu:${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04', '26.04', '26.10']
     steps:
       - uses: actions/checkout@v4
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        with:
+          persist-credentials: false
+      - name: Install test tools inside the disposable container
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 shellcheck
       - name: Run regression and generated-helper checks
         env:
           GRE4_REQUIRE_SHELLCHECK: "1"
         run: python3 -B -m unittest discover -s tests -v
-      - name: Check Bash syntax
-        run: bash -n gre4.sh
-      - name: Check ShellCheck warnings
-        run: shellcheck --severity=warning gre4.sh
+      - name: Check Bash syntax and ShellCheck warnings
+        run: bash -n gre4.sh && shellcheck --severity=warning gre4.sh
+
+  ubuntu-vm:
+    name: Ubuntu ${{ matrix.ubuntu }} real GRE/systemd/UFW
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04', '26.04', '26.10']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install VM tools on the disposable runner
+        timeout-minutes: 10
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils ovmf
+      - name: Allow KVM acceleration when the disposable runner exposes it
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo chmod a+rw /dev/kvm
+          fi
+      - name: Run three-VM acceptance with the target Ubuntu kernel
+        run: python3 -B tests/integration/ubuntu_vm.py --release '${{ matrix.ubuntu }}'
+      - name: Keep non-secret versions, results and guest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-${{ matrix.ubuntu }}-acceptance
+          path: dist/ubuntu-${{ matrix.ubuntu }}/
+          if-no-files-found: error

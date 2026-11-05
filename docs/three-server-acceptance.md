@@ -6,6 +6,11 @@ and an operator/client machine that can reach both Iran public IPs. Keep a
 provider console or another management path throughout the test. Do not run the
 failure or reboot cases on production traffic.
 
+The automated Ubuntu VM matrix and its evidence limits are described in
+[Ubuntu compatibility](ubuntu-compatibility.md). Those isolated VM runs do not
+replace this gate for provider GRE filtering, public networking, or an existing
+production deployment.
+
 Record the source commit, Linux distribution/kernel, systemd/UFW/iptables
 versions, public endpoint addresses, tunnel subnets, selected ports, UFW state,
 and the result of each case. Never include credentials in the record.

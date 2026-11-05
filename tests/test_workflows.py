@@ -7,9 +7,9 @@ from profile_fixture import ProfileRuntimeCase
 
 
 class AddWorkflowTests(ProfileRuntimeCase):
-    def add(self, role, expected=0):
+    def add(self, role, expected=0, prefix=''):
         local, peer = ('198.51.100.1', '192.0.2.10') if role == 'iran' else ('192.0.2.10', '198.51.100.1')
-        return self.shell(f'''add_profile_interactive {role} <<'ANSWERS'
+        return self.shell(prefix + f'''add_profile_interactive {role} <<'ANSWERS'
 new
 {local}
 {peer}
@@ -73,6 +73,49 @@ ANSWERS
         self.assertFalse((self.state_dir / 'profiles/new').exists())
         self.assertTrue((self.profiles / 'new.conf').is_file())
         self.assert_sibling(before)
+
+    def test_failed_activation_cannot_be_hidden_by_enable_success(self):
+        foreign = {'local': '', 'remote': '', 'alias': 'administrator',
+                   'addresses': [], 'up': True}
+        self.update(interfaces={'g4-new': foreign})
+        # Some systemctl versions report a successful enable even when --now
+        # logs a failed start. Keep the actual failed service state observable.
+        result = self.add('kharej', expected=1, prefix='''systemctl() {
+  if [[ $1 == enable && $2 == --now ]]; then
+    command systemctl "$@" || return 0
+  else
+    command systemctl "$@"
+  fi
+}
+''')
+        self.assertIn('Connection setup failed', result.stdout + result.stderr)
+        self.assertNotIn('Use this matching configuration', result.stdout)
+        self.assertEqual(self.data()['interfaces'], {'g4-new': foreign})
+        self.assertFalse(self.data()['active']['gre4@new.service'])
+        self.assertTrue((self.profiles / 'new.conf').is_file())
+
+    def test_inactive_service_is_not_reported_as_a_successful_add(self):
+        result = self.add('kharej', expected=1, prefix='''systemctl() {
+  if [[ $1 == start ]]; then return 0; fi
+  if [[ $1 == enable ]]; then command systemctl enable "${@: -1}"; return; fi
+  command systemctl "$@"
+}
+''')
+        self.assertIn('Connection setup failed', result.stdout + result.stderr)
+        self.assertNotIn('Use this matching configuration', result.stdout)
+        self.assertEqual(self.data()['interfaces'], {})
+        self.assertTrue((self.profiles / 'new.conf').is_file())
+
+    def test_start_service_verifies_active_state_after_successful_command(self):
+        self.config('new', role='kharej')
+        result = self.shell('''systemctl() {
+  if [[ $1 == start ]]; then return 0; fi
+  command systemctl "$@"
+}
+profile_start_service new
+''', expected=1)
+        self.assertIn('Connection did not become active', result.stdout + result.stderr)
+        self.assertEqual(self.data()['interfaces'], {})
 
 
 class CanonicalMigrationWorkflowTests(ProfileRuntimeCase):
@@ -149,6 +192,53 @@ systemctl enable --now gre4.service
         self.assertEqual((self.state_dir / 'profiles/legacy/applied.conf').read_bytes(),
                          (self.profiles / 'legacy.conf').read_bytes())
 
+    def test_canonical_migration_handles_mixed_case_ssh_dump_without_rewriting_old_helper(self):
+        self.shell('systemctl stop gre4.service\n')
+        self.update(ufw_active=True)
+        self.shell('''sed -i 's/ROLE="iran"/ROLE="kharej"/; s/LOCAL_PUBLIC_IP="198.51.100.1"/LOCAL_PUBLIC_IP="192.0.2.10"/; s/PEER_PUBLIC_IP="192.0.2.10"/PEER_PUBLIC_IP="198.51.100.1"/' "$LEGACY_CONF_FILE"
+systemctl start gre4.service
+''')
+        self.assertTrue(any('gre4-managed' in rule for rule in self.data()['ufw_rules']))
+        old_helper = self.helper.read_bytes()
+        ssh_rule = '7443/tcp on eth0 ALLOW IN 203.0.113.10 # gre4-managed'
+        self.update(sshd='Port 2222\nListenAddress [::]:7443\n',
+                    ufw_rules=self.data()['ufw_rules'] + [ssh_rule])
+        # systemd can complete the stop job despite failed ExecStopPost; the
+        # manager must still complete checked explicit legacy cleanup afterward.
+        self.shell('''systemctl() {
+  if [[ $1 == stop && $2 == gre4.service ]]; then
+    command systemctl "$@" || return 0
+  else
+    command systemctl "$@"
+  fi
+}
+''' + f'LEGACY_HELPER_SHA256={self.mapped_digest}\nmigrate_legacy_deployment\n'
+            + 'if declare -F sshd >/dev/null; then exit 71; fi\n', timeout=45)
+        state = self.data()
+        self.assertTrue(state['active']['gre4@legacy.service'])
+        self.assertIn(ssh_rule, state['ufw_rules'])
+        self.assertFalse(any('gre4-managed' in rule and rule != ssh_rule for rule in state['ufw_rules']))
+        backup = next((self.root / 'backups').glob('migration.*'))
+        self.assertEqual((backup / 'gre4-apply.sh').read_bytes(), old_helper)
+        self.assertFalse((self.root / 'backups/pending').exists())
+
+    def test_compatible_cleanup_keeps_rules_and_original_files_when_ssh_dump_is_invalid(self):
+        self.shell('systemctl stop gre4.service\n')
+        self.update(ufw_active=True)
+        self.shell('''sed -i 's/ROLE="iran"/ROLE="kharej"/; s/LOCAL_PUBLIC_IP="198.51.100.1"/LOCAL_PUBLIC_IP="192.0.2.10"/; s/PEER_PUBLIC_IP="192.0.2.10"/PEER_PUBLIC_IP="198.51.100.1"/' "$LEGACY_CONF_FILE"
+systemctl start gre4.service
+''')
+        original_rules = self.data()['ufw_rules']
+        original_helper = self.helper.read_bytes()
+        original_config = (self.root / 'legacy.conf').read_bytes()
+        for dump in ('Port invalid\n', 'UnknownDirective 2222\n'):
+            with self.subTest(dump=dump):
+                self.update(sshd=dump)
+                self.shell(f'LEGACY_HELPER_SHA256={self.mapped_digest}\nlegacy_stop_compatible\n', expected=1)
+                self.assertEqual(self.data()['ufw_rules'], original_rules)
+                self.assertEqual(self.helper.read_bytes(), original_helper)
+                self.assertEqual((self.root / 'legacy.conf').read_bytes(), original_config)
+
     def test_failed_new_activation_retains_live_recovery_then_rolls_back_on_retry(self):
         # Fail after new GRE creation and prevent cleanup, beginning only at cutover.
         self.shell('''original_install=$(declare -f install_apply_script)
@@ -190,3 +280,54 @@ FAIL
         self.assertFalse((self.root / 'backups/pending').exists())
         self.assertEqual((self.state_dir / 'sysctl/forward/values').read_bytes(), live_values)
         self.assertEqual(hashlib.sha256(self.helper.read_bytes()).hexdigest(), self.mapped_digest)
+
+
+class LegacyStopBridgeTests(ProfileRuntimeCase):
+    def setUp(self):
+        super().setUp()
+        self.helper.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+sshd -T > "${GRE4_FAKE_STATE}.normalized"
+sshd -V > "${GRE4_FAKE_STATE}.other"
+''')
+        self.helper.chmod(0o700)
+        self.digest = hashlib.sha256(self.helper.read_bytes()).hexdigest()
+
+    def compatible_stop(self, expected=0, prefix=''):
+        return self.shell(prefix + f'LEGACY_HELPER_SHA256={self.digest}\nlegacy_stop_compatible\n'
+                          + 'if declare -F sshd >/dev/null; then exit 71; fi\n', expected)
+
+    def test_only_dump_directive_names_are_normalized_and_helper_is_unchanged(self):
+        dump = '  Port 2222\nListenAddress [::]:7443\nAuthorizedKeysCommand /bin/check MixedCaseArg\n'
+        self.update(sshd=dump)
+        self.compatible_stop()
+        self.assertEqual(Path(str(self.fake) + '.normalized').read_text(),
+                         '  port 2222\nlistenaddress [::]:7443\nauthorizedkeyscommand /bin/check MixedCaseArg\n')
+        self.assertEqual(Path(str(self.fake) + '.other').read_text(), dump)
+        self.assertEqual(hashlib.sha256(self.helper.read_bytes()).hexdigest(), self.digest)
+
+    def test_dump_failure_is_not_converted_into_success(self):
+        self.update(failures=['sshd -T'])
+        self.compatible_stop(expected=1)
+        self.assertNotIn('sshd -V', self.data()['commands'])
+
+    def test_dump_failure_preserves_exit_code_and_diagnostic(self):
+        (self.bin / 'sshd').write_text('#!/usr/bin/env bash\necho "invalid SSH configuration" >&2\nexit 23\n')
+        result = self.compatible_stop(expected=23)
+        self.assertIn('invalid SSH configuration', result.stderr)
+        self.assertNotIn('sshd -V', self.data()['commands'])
+
+    def test_unknown_helper_is_rejected_before_execution(self):
+        self.shell('LEGACY_HELPER_SHA256=unknown\nif legacy_stop_compatible; then exit 71; fi\n')
+        self.assertFalse(Path(str(self.fake) + '.normalized').exists())
+
+    def test_missing_external_sshd_does_not_introduce_a_function(self):
+        self.helper.write_text('''#!/usr/bin/env bash
+[[ $(type -t sshd) != function ]]
+''')
+        self.digest = hashlib.sha256(self.helper.read_bytes()).hexdigest()
+        self.compatible_stop(prefix='''type() {
+  if [[ $* == '-P sshd' ]]; then return 1; fi
+  builtin type "$@"
+}
+''')

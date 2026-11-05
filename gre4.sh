@@ -308,13 +308,50 @@ profile_interface_owned() {
   [[ " $details " == *" alias gre4:$PROFILE_ID "* ]]
 }
 
+profile_preflight() {
+  local command status value
+  for command in ip sysctl flock; do ensure_cmd "$command" || return 1; done
+  if [[ "$ROLE" == iran ]]; then ensure_cmd iptables || return 1; fi
+  if command -v ufw >/dev/null 2>&1; then
+    status=$(LC_ALL=C ufw status 2>/dev/null) || { err "Cannot inspect UFW before starting."; return 1; }
+    if [[ "${status%%$'\n'*}" == "Status: active" ]]; then
+      ensure_cmd iptables-restore || return 1
+    fi
+  fi
+  [[ "$ROLE" == kharej ]] || return 0
+  if value=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null); then
+    [[ "$value" =~ ^[0-9]+$ ]] && return 0
+  fi
+  if ! command -v modprobe >/dev/null 2>&1 || ! modprobe nf_conntrack; then
+    err "Cannot prepare nf_conntrack. Check kmod, kernel support and module permissions before retrying."
+    return 1
+  fi
+  if ! value=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null) || [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    err "nf_conntrack_max is unavailable after module preparation; this kernel or environment may restrict conntrack."
+    return 1
+  fi
+}
+
 profile_setup_gre() {
+  local created_index details
   if ip link show "$TUN_IF" >/dev/null 2>&1; then
     profile_interface_owned || { err "Refusing interface not owned by $PROFILE_ID: $TUN_IF"; return 1; }
     ip tunnel del "$TUN_IF" || return
   fi
-  # One creation request prevents a partial tunnel without an ownership alias.
   ip link add name "$TUN_IF" alias "gre4:$PROFILE_ID" type gre remote "$PEER_PUBLIC_IP" local "$LOCAL_PUBLIC_IP" || return
+  details=$(ip -d -o link show dev "$TUN_IF") || return
+  created_index=${details%%:*}
+  # Some kernels ignore the alias on creation; set and verify it separately.
+  if ! ip link set dev "$TUN_IF" alias "gre4:$PROFILE_ID" || ! profile_interface_owned; then
+    err "Cannot establish interface ownership: $TUN_IF"
+    if details=$(ip -d -o link show dev "$TUN_IF") && [[ ${details%%:*} == "$created_index" ]] &&
+        { [[ " $details " != *" alias "* ]] || [[ " $details " == *" alias gre4:$PROFILE_ID "* ]]; }; then
+      ip tunnel del "$TUN_IF" || return
+    else
+      err "Interface changed during creation; preserving $TUN_IF for manual recovery."
+    fi
+    return 1
+  fi
   if [[ "$ROLE" == iran ]]; then ip addr add "$IRAN_TUN_CIDR" dev "$TUN_IF" || return
   else ip addr add "$KHAREJ_TUN_CIDR" dev "$TUN_IF" || return; fi
   ip link set "$TUN_IF" mtu 1420 || return
@@ -417,9 +454,9 @@ profile_write_ufw_block() {
 profile_shared_ssh_ports() {
   local config key value port found=0
   if ! command -v sshd >/dev/null 2>&1; then return 0; fi
-  config=$(sshd -T 2>/dev/null) || { err "Cannot inspect SSH; keeping shared UFW rules."; return 1; }
+  config=$(sshd -T) || { err "Cannot inspect SSH; keeping shared UFW rules."; return 1; }
   while read -r key value _; do
-    case "$key" in port) port=$value ;; listenaddress) port=${value##*:} ;; *) continue ;; esac
+    case "${key,,}" in port) port=$value ;; listenaddress) port=${value##*:} ;; *) continue ;; esac
     validate_port "$port" || return 1
     printf '%s\n' "$((10#$port))"
     found=1
@@ -568,6 +605,7 @@ profile_start() (
   [[ ! -L "$STATE_DIR" && ! -L "$STATE_DIR/profiles" && ! -L "$state" && ! -L "$PROFILE_DIR" ]] || return 1
   [[ ! -e "$state/cleanup-pending" ]] || { err "Cleanup pending for $id; stop it successfully before starting."; return 1; }
   load_profile "$id" || return
+  profile_preflight || return 78
   check_local_public_ip "$LOCAL_PUBLIC_IP" || return
   profile_conflicts "$id" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" || return
   check_host_network_conflicts "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" || return
@@ -625,7 +663,7 @@ log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 err()  { echo -e "\e[1;31m[-]\e[0m $*" >&2; }
 
-ensure_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }; }
+ensure_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; return 1; }; }
 
 # iptables helpers (idempotent)
 sysctl_apply_file() {
@@ -808,7 +846,7 @@ ufw_is_active() {
 
 ufw_before_rules_test() {
   local file="$1"
-  command -v iptables-restore >/dev/null 2>&1 || return 0
+  ensure_cmd iptables-restore || return 1
   iptables-restore --test < "$file"
 }
 
@@ -852,11 +890,16 @@ ufw_has_public_allow() {
 }
 
 GRE4_RUNTIME
-  declare -f validate_ipv4 validate_port normalize_ports_list validate_profile_id private_directory private_config_file ipv4_number number_ipv4 cidr_bounds profile_subnet read_profile_file load_profile check_local_public_ip check_host_network_conflicts profile_conflicts profile_runtime_lock profile_edit_lock profile_state_directory profile_interface_owned profile_setup_gre profile_ipt_add profile_ipt_del profile_nat profile_requirements profile_write_ufw_block profile_shared_ssh_ports profile_ufw_reconcile profile_reapply_sysctl profile_shared_sysctl profile_migration_start_allowed legacy_safe_path legacy_owned_file profile_start profile_stop >> "$staged" || { rm -f "$staged"; return 1; }
+  declare -f validate_ipv4 validate_port normalize_ports_list validate_profile_id private_directory private_config_file ipv4_number number_ipv4 cidr_bounds profile_subnet read_profile_file load_profile check_local_public_ip check_host_network_conflicts profile_conflicts profile_runtime_lock profile_edit_lock profile_state_directory profile_interface_owned profile_preflight profile_setup_gre profile_ipt_add profile_ipt_del profile_nat profile_requirements profile_write_ufw_block profile_shared_ssh_ports profile_ufw_reconcile profile_reapply_sysctl profile_shared_sysctl profile_migration_start_allowed legacy_safe_path legacy_owned_file profile_start profile_stop >> "$staged" || { rm -f "$staged"; return 1; }
   cat >> "$staged" <<'GRE4_DISPATCH' || { rm -f "$staged"; return 1; }
 case "${1:-start}" in
   start) [[ $# == 2 ]] || { echo "Usage: $0 {start|stop} <connection-id>"; exit 1; }; profile_start "$2" ;;
   stop) [[ $# == 2 ]] || { echo "Usage: $0 {start|stop} <connection-id>"; exit 1; }; profile_stop "$2" ;;
+  post-stop)
+    [[ $# == 2 ]] || exit 1
+    # A preflight-only rejection must not clean an already applied deployment.
+    if [[ ${EXIT_CODE:-} == exited && ${EXIT_STATUS:-} == 78 ]]; then exit 0; fi
+    profile_stop "$2" ;;
   *) echo "Usage: $0 {start|stop} <connection-id>"; exit 1 ;;
 esac
 GRE4_DISPATCH
@@ -872,12 +915,12 @@ install_profile_unit() {
 [Unit]
 Description=GRE4 connection %i
 Wants=network-online.target
-After=network-online.target
+After=network-online.target ssh.service ssh.socket
 
 [Service]
 Type=oneshot
 ExecStart=$APPLY_SCRIPT start %i
-ExecStopPost=$APPLY_SCRIPT stop %i
+ExecStopPost=$APPLY_SCRIPT post-stop %i
 RemainAfterExit=yes
 
 [Install]
@@ -898,9 +941,13 @@ profile_normal_mutation_allowed() {
 
 profile_start_service() {
   validate_profile_id "$1" && profile_normal_mutation_allowed || return 1
-  if [[ ! -x "$APPLY_SCRIPT" ]]; then install_apply_script || return; fi
-  if [[ ! -f "$TEMPLATE_FILE" ]]; then install_profile_unit || return; fi
-  systemctl start "gre4@$1.service"
+  ( load_profile "$1" && profile_preflight ) || return 1
+  # Refresh the paired helper/unit so old ExecStopPost cannot bypass preflight protection.
+  install_apply_script && install_profile_unit || return
+  if ! systemctl start "gre4@$1.service" || ! systemctl is-active --quiet "gre4@$1.service"; then
+    err "Connection did not become active: $1"
+    return 1
+  fi
 }
 
 profile_stop_service() {
@@ -934,6 +981,7 @@ profile_update() (
   profile_runtime_lock || return
   render_profile "$id" "$@" >/dev/null || return
   check_local_public_ip "$2" || return
+  ( ROLE="$1"; profile_preflight ) || return 1
   flock -u 8; exec 8>&-
   profile_stop_service "$id" || return
   profile_runtime_lock || return
@@ -994,11 +1042,14 @@ add_profile_interactive() (
   ports=$(prompt_default "Service ports (comma-separated)" "2096")
   udp=$(prompt_default "Forward/allow UDP too? (yes/no)" "no")
   subnet=$(prompt_default "Tunnel /30 network (use the SAME network at both ends)" "$(suggest_profile_subnet)")
+  ( ROLE="$role"; profile_preflight ) || return 1
   profile_runtime_lock || return
   write_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet" || return
   flock -u 8; exec 8>&-
   install_apply_script && install_profile_unit || return
-  if ! systemctl enable --now "gre4@$id.service"; then
+  if ! systemctl enable "gre4@$id.service" ||
+      ! systemctl start "gre4@$id.service" ||
+      ! systemctl is-active --quiet "gre4@$id.service"; then
     err "Connection setup failed; configuration retained. Inspect status and retry Stop before Start."
     return 1
   fi
@@ -1041,7 +1092,7 @@ manage_profile_menu() {
          profile_update "$id" "$ROLE" "$local_ip" "$peer" "$ports" "$udp" "$subnet" "$TUN_IF" || return ;;
       7) ( acquire_management_lock && profile_start_service "$id" ) || return ;;
       8) ( acquire_management_lock && profile_stop_service "$id" ) || return ;;
-      9) ( acquire_management_lock && profile_stop_service "$id" && profile_start_service "$id" ) || return ;;
+      9) ( acquire_management_lock && profile_preflight && profile_stop_service "$id" && profile_start_service "$id" ) || return ;;
       10) if [[ $(prompt_default "Type $id to confirm removal" "") == "$id" ]]; then profile_remove "$id"; return; fi ;;
       11) return ;;
       *) err "Invalid option." ;;
@@ -1125,6 +1176,30 @@ legacy_verify_helper() {
     return 1
   }
 }
+
+legacy_stop_compatible() (
+  legacy_verify_helper || return
+  if type -P sshd >/dev/null 2>&1; then
+    # Older verified helpers expect lowercase keywords from OpenSSH's dump.
+    sshd() {
+      local config line
+      if [[ $# == 1 && $1 == -T ]]; then
+        config=$(command sshd "$@") || return
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          if [[ "$line" =~ ^([[:space:]]*)([^[:space:]]+)(.*)$ ]]; then
+            printf '%s%s%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2],,}" "${BASH_REMATCH[3]}"
+          else
+            printf '%s\n' "$line"
+          fi
+        done <<< "$config"
+      else
+        command sshd "$@"
+      fi
+    }
+    export -f sshd
+  fi
+  "$APPLY_SCRIPT" stop
+)
 
 legacy_verify_effective_unit() {
   local fragment dropins reload
@@ -1326,7 +1401,8 @@ migrate_legacy_deployment() (
     cmp -s "$legacy_conf" "$backup/gre4.conf" && cmp -s "$APPLY_SCRIPT" "$backup/gre4-apply.sh" && cmp -s "$legacy_unit" "$backup/gre4.service" || {
       err "Legacy installation changed during migration; review backup $backup"; return 1;
     }
-    if ! systemctl stop gre4.service || ! "$APPLY_SCRIPT" stop; then
+    profile_preflight || return 1
+    if ! systemctl stop gre4.service || ! legacy_stop_compatible; then
       err "Legacy cleanup failed; original installation retained. Retry migration after recovery. Backup: $backup"
       return 1
     fi

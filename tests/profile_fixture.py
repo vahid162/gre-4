@@ -42,13 +42,22 @@ elif tool == 'sysctl':
         if key == 'net.ipv4.ip_forward' and previous != value:
             state['sysctl']['net.ipv4.conf.all.forwarding'] = value
     if args[0] == '-n':
-        output = state['sysctl'][args[1]]
+        if args[1] in state['sysctl']:
+            output = state['sysctl'][args[1]]
+        else:
+            rc = 1
     elif args[0] == '-w':
         write(args[1])
     elif args[0] == '-p':
         for entry in Path(args[1]).read_text().splitlines():
             if entry and not entry.startswith('#'):
                 write(entry)
+    else:
+        rc = 99
+elif tool == 'modprobe':
+    if args == ['nf_conntrack']:
+        if state.get('modprobe_loads_conntrack', True):
+            state['sysctl']['net.netfilter.nf_conntrack_max'] = '32768'
     else:
         rc = 99
 elif tool == 'ip':
@@ -59,7 +68,8 @@ elif tool == 'ip':
             rc = 2
         else:
             interfaces[name] = {'local': value_after('local'), 'remote': value_after('remote'),
-                                'alias': value_after('alias'), 'addresses': [], 'up': False}
+                                'alias': '' if state.get('drop_create_alias', True) else value_after('alias'),
+                                'addresses': [], 'up': False}
     elif args[:2] in (['tunnel', 'del'], ['tunnel', 'delete']):
         name = args[2]
         if name in interfaces:
@@ -71,7 +81,8 @@ elif tool == 'ip':
         if name not in interfaces:
             rc = 1
         elif 'alias' in args:
-            interfaces[name]['alias'] = value_after('alias')
+            if not state.get('ignore_alias_set'):
+                interfaces[name]['alias'] = state.get('alias_set_override', value_after('alias'))
         elif 'up' in args:
             interfaces[name]['up'] = True
     elif args[:2] in (['addr', 'add'], ['address', 'add']):
@@ -96,8 +107,9 @@ elif tool == 'ip':
             for name, item in selected:
                 output += (f'1: {name}: <POINTOPOINT,UP> mtu 1420\n'
                            f'    link/gre {item["local"]} peer {item["remote"]}\n'
-                           f'    gre remote {item["remote"]} local {item["local"]}\n'
-                           f'    alias {item["alias"]}\n')
+                           f'    gre remote {item["remote"]} local {item["local"]}\n')
+                if item['alias']:
+                    output += f'    alias {item["alias"]}\n'
     else:
         rc = 99
 elif tool == 'iptables':
@@ -148,12 +160,17 @@ elif tool == 'systemctl':
         helper = os.environ['GRE4_FAKE_HELPER']
         def invoke(operation):
             return subprocess.run(['bash', helper, operation] + ([profile] if profile else [])).returncode
+        def cleanup(status=0):
+            if profile:
+                return subprocess.run(['bash', helper, 'post-stop', profile],
+                                      env=dict(os.environ, EXIT_CODE='exited', EXIT_STATUS=str(status))).returncode
+            return invoke('stop')
         if dispatch in ('stop', 'restart'):
-            rc = invoke('stop')
+            rc = cleanup()
         if not rc and dispatch in ('start', 'restart'):
             rc = invoke('start')
             if rc:
-                invoke('stop')  # ExecStopPost also runs after a failed oneshot start.
+                cleanup(rc)  # ExecStopPost also runs after a failed oneshot start.
         with path.with_suffix('.lock').open('a') as final_lock:
             fcntl.flock(final_lock, fcntl.LOCK_EX)
             state = json.loads(path.read_text())
@@ -230,7 +247,7 @@ class ProfileRuntimeCase(unittest.TestCase):
             'sysctl': {'net.ipv4.ip_forward': '0', 'net.ipv4.conf.all.forwarding': '0',
                        'net.netfilter.nf_conntrack_max': '32768'},
         }))
-        for name in ('ip', 'iptables', 'iptables-save', 'iptables-restore', 'ufw', 'sysctl', 'sshd', 'systemctl'):
+        for name in ('ip', 'iptables', 'iptables-save', 'iptables-restore', 'ufw', 'sysctl', 'modprobe', 'sshd', 'systemctl'):
             executable = self.bin / name
             executable.write_text(FAKE_COMMAND)
             executable.chmod(0o755)

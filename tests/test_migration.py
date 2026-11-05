@@ -71,6 +71,8 @@ real_write_profile=$(declare -f write_profile)
 real_install_apply_script=$(declare -f install_apply_script)
 real_install_profile_unit=$(declare -f install_profile_unit)
 acquire_management_lock() { :; }
+# Migration orchestration does not inspect the host's tools or modules.
+profile_preflight() { :; }
 systemctl() {
   printf 'systemctl %s\n' "$*" >> "$MIGRATION_TEST_LOG"
   case $1 in
@@ -178,7 +180,7 @@ load_profile legacy
 [[ $IRAN_TUN_CIDR == 172.16.1.1/30 && $KHAREJ_TUN_CIDR == 172.16.1.2/30 ]]
 bash -n "$APPLY_SCRIPT"
 grep -Fxq "ExecStart=$APPLY_SCRIPT start %i" "$TEMPLATE_FILE"
-grep -Fxq "ExecStopPost=$APPLY_SCRIPT stop %i" "$TEMPLATE_FILE"
+grep -Fxq "ExecStopPost=$APPLY_SCRIPT post-stop %i" "$TEMPLATE_FILE"
 if bash "$APPLY_SCRIPT" start; then exit 1; fi
 backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'migration.*')
 printf '%s\n' "$backup" > "$MIGRATION_BACKUP_DIR/pending"
@@ -195,6 +197,14 @@ LEGACY_HELPER_SHA256=unknown
 if migrate_legacy_deployment; then exit 1; fi
 [[ -f $LEGACY_CONF_FILE && -f $LEGACY_UNIT_FILE ]]
 [[ ! -e $MIGRATION_TEST_LOG ]]
+''')
+
+    def test_preflight_rejection_preserves_legacy_connection(self):
+        self.run_migration(r'''
+profile_preflight() { return 1; }
+if migrate_legacy_deployment; then exit 71; fi
+[[ -f $CONF_FILE && -x $APPLY_SCRIPT && -f $UNIT_FILE ]]
+! grep -q 'systemctl stop\|old-helper stop\|install-new-helper' "$MIGRATION_TEST_LOG"
 ''')
 
     def test_unowned_sysctl_file_blocks_migration(self):

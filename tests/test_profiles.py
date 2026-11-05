@@ -404,6 +404,52 @@ WRITER
         self.assertFalse(any(command.startswith('ufw allow') and 'port 7443 ' in command
                              for command in self.data()['commands']))
 
+    def test_openssh_mixed_case_dump_keeps_shared_ssh_allowance(self):
+        original = '7443/tcp ALLOW IN Anywhere # gre4-shared'
+        self.update(ufw_active=True, ufw_rules=[original],
+                    sshd='Port 2222\nListenAddress 0.0.0.0:7443\nListenAddress [::]:7443\n')
+        self.config('iran1', role='kharej')
+        self.invoke('start', 'iran1')
+        self.invoke('stop', 'iran1')
+        self.assertEqual(self.data()['ufw_rules'], [original])
+        self.assertFalse((self.state_dir / 'profiles/iran1').exists())
+
+    def test_ssh_keyword_case_is_normalized_in_source_and_generated_helper(self):
+        for config, expected in (
+                ('port 2222\nlistenaddress [::]:7443\n', {'2222', '7443'}),
+                ('Port 2222\nListenAddress [::]:7443\n', {'2222', '7443'}),
+                ('ListenAddress 0.0.0.0:7443\nListenAddress [::]:7443\n', {'7443'})):
+            with self.subTest(config=config):
+                self.update(sshd=config)
+                source = self.shell('profile_shared_ssh_ports\n').stdout
+                generated = self.runtime_shell('profile_shared_ssh_ports\n')
+                self.assertEqual(set(source.split()), expected)
+                self.assertEqual(set(generated.split()), expected)
+
+    def test_unknown_or_invalid_ssh_dump_still_retains_cleanup_state(self):
+        self.update(ufw_active=True)
+        self.config('iran1', role='kharej')
+        self.invoke('start', 'iran1')
+        before = self.data()['ufw_rules']
+        for config in ('Port invalid\n', 'ListenAddress [::]:0\n', 'PidFile /run/sshd.pid\n'):
+            with self.subTest(config=config):
+                self.update(sshd=config)
+                self.invoke('stop', 'iran1', success=False)
+                self.assertEqual(self.data()['ufw_rules'], before)
+                self.assertTrue((self.state_dir / 'profiles/iran1/cleanup-pending').exists())
+        self.update(sshd='Port 2222\n')
+        self.invoke('stop', 'iran1')
+
+    def test_failed_ssh_inspection_retains_its_diagnostic(self):
+        output = self.runtime_shell('''sshd() {
+  printf '%s\\n' 'Missing privilege separation directory: /run/sshd' >&2
+  return 1
+}
+profile_shared_ssh_ports
+''', expected=1)
+        self.assertIn('Missing privilege separation directory', output)
+        self.assertIn('Cannot inspect SSH', output)
+
     def test_reload_failure_retains_cleanup_snapshot_and_can_be_retried(self):
         self.update(ufw_active=True)
         self.config('iran1', role='kharej', number=1)
