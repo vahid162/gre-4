@@ -24,6 +24,8 @@
   temporary-file cleanup and recursive handoff without public-network access.
 - Cover upgrade intent preservation, same-release no-op, preflight rejection,
   unknown installations, rollback and retained recovery records on failures.
+- Recognize only independently derived canonical helper fingerprints, including
+  the different function serialization emitted by Ubuntu 22.04's Bash 5.1.
 - Extend disposable three-VM Ubuntu acceptance with previous-release fixtures,
   outside-only upgrade while Iran remains old, a real GRE-start failure and
   rollback, interruption followed by reboot with persistent masks, and service

@@ -1545,6 +1545,8 @@ release_bootstrap() (
 
 # Unmarked installations are recognized by the canonical helper emitted by v1.1.1.
 UPGRADE_V111_HELPER_SHA256="1bde86457fce770ff00c9e2c339fae9dae152ac5bd72f1385a31f76fa99eb86d"
+# Bash 5.1 serializes declare -f redirections and literal newlines differently.
+UPGRADE_V111_BASH51_HELPER_SHA256="d4b886236ae42f2b0a2e8f7a7ffd83f47137af3ef95ee2c49933098d2e7a28a8"
 RELEASE_STAMP_FILE="/var/lib/gre4-release"
 
 upgrade_safe_directory() {
@@ -1805,7 +1807,10 @@ automatic_upgrade() (
       err "Installed release is newer than the selected release; automatic downgrade refused."; return 1;
     }
   else
-    [[ "$digest" == "$UPGRADE_V111_HELPER_SHA256" ]] || { err "Installed helper is unknown; automatic upgrade refused."; return 1; }
+    case "$digest" in
+      "$UPGRADE_V111_HELPER_SHA256"|"$UPGRADE_V111_BASH51_HELPER_SHA256") ;;
+      *) err "Installed helper is unknown; automatic upgrade refused."; return 1 ;;
+    esac
     # The unmarked release has exactly this template; no edited commands are adopted.
     cmp -s "$TEMPLATE_FILE" <(cat <<EOF_UNIT
 [Unit]

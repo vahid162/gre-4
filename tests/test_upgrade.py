@@ -1,4 +1,7 @@
 """Automatic upgrades use private files and lifecycle substitutes, not host services."""
+import hashlib
+from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +26,7 @@ MIGRATION_BACKUP_DIR=$ROOT/backups
 RELEASE_STAMP_FILE=$ROOT/release
 GRE4_RELEASE_TAG=v1.2.0
 GRE4_RELEASE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+CANONICAL_V111_HELPER_SHA256=$UPGRADE_V111_HELPER_SHA256
 mkdir -p "$PROFILE_DIR" "$STATE_DIR" "$ROOT/active" "$ROOT/enabled" "$ROOT/masked"
 chmod 700 "$PROFILE_DIR" "$STATE_DIR"
 cat > "$APPLY_SCRIPT" <<'HELPER'
@@ -130,6 +134,27 @@ backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'upgrade.*')
 [[ -n $backup && -f $backup/gre4-apply.sh && -f $backup/intent ]]
 cmp "$ROOT/original-helper" "$backup/gre4-apply.sh"
 [[ -z $(find "$ROOT/masked" -type f -print -quit) ]]
+''')
+
+    def test_canonical_previous_release_helper_is_recognized_on_this_bash(self):
+        source = (Path(__file__).parent / 'fixtures/v1.1.1-manager.sh').read_bytes()
+        self.assertEqual(hashlib.sha256(source).hexdigest(),
+                         '796b8a78b29d94509cc0ba9e8e18006b6a043fc010d1625e917a4b4196f07f7f')
+        with tempfile.TemporaryDirectory(prefix='gre4-canonical-helper-') as directory:
+            helper = Path(directory) / 'helper.sh'
+            result = subprocess.run(['bash', '-se'],
+                                    input=source.decode().rsplit('\nmain "$@"', 1)[0] +
+                                    '\nAPPLY_SCRIPT=' + shlex.quote(str(helper)) + '\ninstall_apply_script\n',
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # Only recognition is exercised: the historical helper embeds live paths
+            # and must never be executed by this isolated regression test.
+            self.run_upgrade('cp ' + shlex.quote(str(helper)) + ' "$APPLY_SCRIPT"\n' + r'''
+UPGRADE_V111_HELPER_SHA256=$CANONICAL_V111_HELPER_SHA256
+upgrade_apply() { touch "$ROOT/canonical-recognized"; }
+upgrade_rollback() { return 1; }
+invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+[[ -f $ROOT/canonical-recognized ]]
 ''')
 
     def test_same_release_does_not_restart_reinstall_or_create_backup(self):
