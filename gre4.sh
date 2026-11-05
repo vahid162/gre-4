@@ -1772,9 +1772,10 @@ automatic_upgrade() (
     [[ -n "$unit" ]] || continue
     upgrade_verify_listed_unit "$unit" || return
   done <<< "$units"
-  units=$(systemctl list-unit-files --no-legend 'gre4@*.service') || return
+  # systemctl treats a pattern with no matching unit files as an error.
+  units=$(systemctl list-unit-files --no-legend) || return
   while read -r unit extra; do
-    [[ -n "$unit" ]] || continue
+    [[ "$unit" == gre4@*.service ]] || continue
     upgrade_verify_listed_unit "$unit" || return
   done <<< "$units"
   if [[ "$count" == 0 && ! -e "$APPLY_SCRIPT" && ! -e "$TEMPLATE_FILE" && ! -e "$RELEASE_STAMP_FILE" ]]; then

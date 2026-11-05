@@ -50,7 +50,17 @@ systemctl() {
           else echo disabled; fi ;;
         *) return 99 ;;
       esac ;;
-    list-units|list-unit-files) [[ ! -f $ROOT/cached-instance ]] || echo 'gre4@removed.service loaded inactive dead' ;;
+    list-units) [[ ! -f $ROOT/cached-instance ]] || echo 'gre4@removed.service loaded inactive dead' ;;
+    list-unit-files)
+      [[ ! -f $ROOT/fail-unit-discovery ]] || { echo 'unit discovery failed' >&2; return 42; }
+      if [[ ${@: -1} == 'gre4@*.service' ]]; then
+        # systemctl reports no matching unit files as a failure on a fresh host.
+        [[ -e $TEMPLATE_FILE || -f $ROOT/cached-instance ]] || return 1
+      else
+        echo 'ssh.service enabled enabled'
+      fi
+      [[ ! -e $TEMPLATE_FILE ]] || echo 'gre4@.service disabled enabled'
+      [[ ! -f $ROOT/cached-instance ]] || echo 'gre4@removed.service disabled enabled' ;;
     is-enabled)
       [[ ! -f $ROOT/masked/$id ]] || { echo masked; return 1; }
       [[ -f $ROOT/enabled/$id ]] && { echo enabled; return 0; }; echo disabled; return 1 ;;
@@ -202,13 +212,33 @@ if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
 ! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
 ''')
 
-    def test_fresh_host_needs_no_runtime_installation_until_setup(self):
+    def test_fresh_host_opens_menu_without_installing_runtime(self):
         self.run_upgrade(r'''
-rm -rf "$PROFILE_DIR" "$STATE_DIR"
+rm -rf "$PROFILE_DIR" "$STATE_DIR" "$ROOT/active" "$ROOT/enabled"
+mkdir "$ROOT/active" "$ROOT/enabled"
 rm "$APPLY_SCRIPT" "$TEMPLATE_FILE"
 : > "$ROOT/log"
-invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+need_root() { :; }
+ensure_cmd() { :; }
+release_verified_handoff() { GRE4_RELEASE_TAG=$1; GRE4_RELEASE_SHA=$2; }
+main_menu() { touch "$ROOT/menu-opened"; }
+main --gre4-release "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA" <<<'4'
+[[ -f $ROOT/menu-opened && ! -e $APPLY_SCRIPT && ! -e $TEMPLATE_FILE ]]
 [[ ! -e $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR ]]
+! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
+''')
+
+    def test_unit_file_discovery_failure_remains_fatal(self):
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh):
+                preparation = ''
+                if fresh:
+                    preparation = 'rm -rf "$PROFILE_DIR" "$STATE_DIR"\nrm "$APPLY_SCRIPT" "$TEMPLATE_FILE"\n'
+                self.run_upgrade(preparation + r'''
+touch "$ROOT/fail-unit-discovery"
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; else [[ $? == 42 ]]; fi
+[[ ! -e $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR ]]
+[[ ! -e $APPLY_SCRIPT ]] || cmp "$ROOT/original-helper" "$APPLY_SCRIPT"
 ! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
 ''')
 

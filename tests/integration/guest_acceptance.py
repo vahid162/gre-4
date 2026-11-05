@@ -35,7 +35,8 @@ def manager(body, check=True):
 def release_command():
     # PR acceptance runs this exact candidate without downloading a prior public release.
     # The network/checksum bootstrap is covered separately with hermetic HTTP substitutes.
-    return ['bash', str(SOURCE), '--gre4-release', 'v' + (ROOT / 'VERSION').read_text().strip(),
+    # Only disposable guests use xtrace; retain the failed guard in acceptance logs.
+    return ['bash', '-x', str(SOURCE), '--gre4-release', 'v' + (ROOT / 'VERSION').read_text().strip(),
             hashlib.sha256(SOURCE.read_bytes()).hexdigest()]
 
 
