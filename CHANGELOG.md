@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-11-05
+
+### Added
+
+- Keep the documented raw-main command as a release bootstrap: resolve the
+  latest stable release once, download both assets from that exact tag, strictly
+  validate the checksum manifest and payload, then execute the verified script.
+- Automatically upgrade recognized profile deployments with private backups,
+  durable transaction records, local health checks and verified rollback when
+  cleanup succeeds. Preserve profile bytes and active/enabled service intent.
+- Record installed releases; opening the same release again leaves services
+  running without reinstallation or restart. Refuse automatic downgrades,
+  modified executables, custom units, ambiguous state and unfinished recovery.
+- Adopt the exact canonical unmarked profile helper from v1.1.1, and route the
+  recognized v1.0.1 singleton through its existing bounded migration path.
+
+### Tests
+
+- Cover release pinning, rejected downloads/manifests, payload verification,
+  temporary-file cleanup and recursive handoff without public-network access.
+- Cover upgrade intent preservation, same-release no-op, preflight rejection,
+  unknown installations, rollback and retained recovery records on failures.
+- Recognize only independently derived canonical helper fingerprints, including
+  the different function serialization emitted by Ubuntu 22.04's Bash 5.1.
+- Extend disposable three-VM Ubuntu acceptance with previous-release fixtures,
+  outside-only upgrade while Iran remains old, a real GRE-start failure and
+  rollback, interruption followed by reboot with persistent masks, and service
+  identity checks for same-release no-op.
+
+### Upgrade notes
+
+- Run the same command separately on each host. No scheduler or remote-peer
+  deployment is installed; destination applications retain their own settings.
+- Active connections may pause during upgrade. Inactive services remain
+  inactive, and enabled/disabled intent is retained.
+- Interrupted cutovers may leave persistent per-instance masks. Preserve the
+  backup and pending record and follow its RECOVERY.txt; do not restore runtime
+  snapshots over live networking. Failed or unverified cleanup requires manual
+  recovery. Existing canonical-singleton rollback limitations remain.
+- HTTPS and the publisher account remain the trust basis; checksums downloaded
+  from the same release are not independent signatures.
+
+### فارسی
+
+- فرمان ثابت نصب، آخرین انتشار پایدار را پیدا می‌کند و اسکریپت و checksum را
+  از همان تگ مشخص می‌گیرد؛ اجرای فایل به تأیید دقیق checksum وابسته است.
+- نصب شناخته‌شده با بکاپ و حفظ آدرس‌ها، پورت‌ها، پروفایل‌ها و وضعیت سرویس‌ها
+  ارتقا پیدا می‌کند. اجرای دوبارهٔ همان انتشار، اتصال‌ها را restart نمی‌کند.
+- نصب ناشناخته یا ویرایش‌شده و بازیابی ناتمام خودکار بازنویسی نمی‌شوند.
+  در قطع عملیات یا شکست پاک‌سازی، بکاپ و journal حفظ می‌شوند و ممکن است
+  بازیابی دستی لازم باشد. اتصال فعال هنگام ارتقا ممکن است وقفه داشته باشد.
+- ارتقا فقط برای همان میزبان است؛ سرور دیگر و برنامهٔ مقصد تغییر نمی‌کنند.
+  آزمون‌های واقعی Ubuntu، ارتقای خارج در کنار ایرانِ قدیمی، شکست و rollback
+  و اجرای دوبارهٔ بدون restart را بررسی می‌کنند.
+
 ## 1.1.1 - 2026-11-05
 
 ### Fixed
