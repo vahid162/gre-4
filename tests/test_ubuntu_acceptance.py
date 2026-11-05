@@ -117,6 +117,35 @@ class UbuntuReadinessTests(unittest.TestCase):
                     vm.ready(old_boot='old-boot')
                 self.assertEqual(vm.ssh.call_count, 5)
 
+    def test_readiness_retries_cloud_init_transport_failure(self):
+        vm = self.make_guest([self.result(), self.result(stdout='new-boot\n'),
+                              self.result(255, stderr='Connection timed out during banner exchange'),
+                              self.result(stdout='status: done\n')])
+        with patch.object(runner.time, 'sleep') as sleep:
+            vm.ready(old_boot='old-boot')
+        sleep.assert_called_once()
+        self.assertEqual(vm.ssh.call_count, 4)
+        self.assertEqual(vm.ssh.call_args.args, ('sudo', 'cloud-init', 'status', '--wait'))
+
+    def test_cloud_init_transport_retries_stop_at_readiness_deadline(self):
+        now = [0]
+
+        def ssh(*args, **kwargs):
+            if args[0] != 'sudo':
+                return self.result(stdout='new-boot\n')
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 180)
+            self.assertLessEqual(now[0] + kwargs['timeout'], 1200)
+            now[0] += kwargs['timeout']
+            return self.result(255, stderr='Connection timed out during banner exchange')
+
+        vm = self.make_guest(ssh)
+        with patch.object(runner.time, 'monotonic', side_effect=lambda: now[0]), \
+                patch.object(runner.time, 'sleep', side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            with self.assertRaisesRegex(TimeoutError, 'iran1 did not finish boot/cloud-init'):
+                vm.ready(old_boot='old-boot')
+        self.assertEqual(now[0], 1200)
+
     def test_readiness_waits_for_boot_id_change(self):
         vm = self.make_guest([self.result(), self.result(stdout='old-boot\n'),
                               self.result(), self.result(stdout='new-boot\n'), self.result()])
@@ -162,11 +191,13 @@ class UbuntuReadinessTests(unittest.TestCase):
         self.assertEqual(vm.ssh.call_count, 2)
 
     def test_readiness_rejects_cloud_init_done_with_nonzero_exit(self):
-        vm = self.make_guest([self.result(), self.result(stdout='new-boot\n'),
-                              self.result(2, stdout='status: done\n')])
-        with self.assertRaises(RuntimeError):
-            vm.ready()
-        self.assertEqual(vm.ssh.call_count, 3)
+        for code in [1, 2]:
+            with self.subTest(code=code):
+                vm = self.make_guest([self.result(), self.result(stdout='new-boot\n'),
+                                      self.result(code, stdout='status: done\n')])
+                with self.assertRaises(RuntimeError):
+                    vm.ready()
+                self.assertEqual(vm.ssh.call_count, 3)
 
     def test_ssh_timeout_records_command_and_partial_output(self):
         vm = runner.Guest.__new__(runner.Guest)
