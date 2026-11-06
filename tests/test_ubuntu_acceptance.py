@@ -1,5 +1,6 @@
 """Offline safety/integrity checks for the real-VM acceptance runner."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 from pathlib import Path
@@ -24,6 +25,105 @@ guest = load('guest_acceptance')
 
 
 class UbuntuAcceptanceSafetyTests(unittest.TestCase):
+    def test_release_command_forwards_operator_arguments_after_verified_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'gre4.sh'
+            source.write_text('# candidate payload\n')
+            (root / 'VERSION').write_text('1.3.0\n')
+            with patch.object(guest, 'ROOT', root), patch.object(guest, 'SOURCE', source):
+                command = guest.release_command('--recover', 'upgrade.selected')
+        self.assertEqual(command[-2:], ['--recover', 'upgrade.selected'])
+        self.assertIn('v1.3.0', command)
+        self.assertIn(hashlib.sha256(b'# candidate payload\n').hexdigest(), command)
+
+    def test_canonical_runtime_fixtures_are_exact_and_reach_disposable_guests(self):
+        for name, expected in (
+                ('v1.1.1-bash51-apply.sh', 'd4b886236ae42f2b0a2e8f7a7ffd83f47137af3ef95ee2c49933098d2e7a28a8'),
+                ('v1.1.1-bash52-apply.sh', '1bde86457fce770ff00c9e2c339fae9dae152ac5bd72f1385a31f76fa99eb86d')):
+            with self.subTest(name=name):
+                path = DIRECTORY.parent / 'fixtures' / name
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
+                self.assertIn(path.resolve(), [item.resolve() for item in runner.GUEST_FILES])
+
+    def test_cutover_chooses_the_other_official_runtime_and_rejects_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = DIRECTORY.parent / 'fixtures'
+            for name in guest.CANONICAL_HELPERS:
+                (root / name).write_bytes((fixtures / name).read_bytes())
+            with patch.object(guest, 'ROOT', root):
+                for name, digest in guest.CANONICAL_HELPERS.items():
+                    other = guest.opposite_canonical_helper(digest)
+                    self.assertNotEqual(hashlib.sha256(other).hexdigest(), digest)
+                    self.assertIn(hashlib.sha256(other).hexdigest(), guest.CANONICAL_HELPERS.values())
+                with self.assertRaisesRegex(AssertionError, 'not an official canonical'):
+                    guest.opposite_canonical_helper('0' * 64)
+                (root / name).write_bytes((root / name).read_bytes() + b'\n# changed\n')
+                with self.assertRaisesRegex(AssertionError, 'Corrupt canonical'):
+                    guest.opposite_canonical_helper(digest)
+
+    def test_cutover_seed_generates_and_validates_candidate_only_in_private_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper, record = root / 'installed-helper', root / 'release'
+            helper.write_bytes(b'previous fixture')
+            record.write_bytes(b'previous record')
+            for name in guest.CANONICAL_HELPERS:
+                (root / name).write_bytes((DIRECTORY.parent / 'fixtures' / name).read_bytes())
+            with patch.object(guest, 'ROOT', root), patch.object(guest, 'HELPER', helper), \
+                    patch.object(guest, 'RECORD', record), \
+                    patch.object(guest, 'SOURCE', DIRECTORY.parent.parent / 'gre4.sh'):
+                # The current generator only writes its private candidate file;
+                # neither canonical historical helper is executed by this check.
+                selected = guest.seed_opposite_canonical_runtime()
+            self.assertEqual(helper.read_bytes(), selected)
+            self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
+            self.assertFalse(record.exists())
+            self.assertIn(hashlib.sha256(selected).hexdigest(), guest.CANONICAL_HELPERS.values())
+
+    def test_snapshot_detects_identical_content_atomic_rewrites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'artifact'
+            path.write_bytes(b'unchanged')
+            before = guest.filesystem_snapshot([path])
+            replacement = root / 'replacement'
+            replacement.write_bytes(b'unchanged')
+            replacement.replace(path)
+            self.assertNotEqual(guest.filesystem_snapshot([path]), before)
+
+    def test_outside_upgrade_and_public_recovery_precede_any_iran_upgrade(self):
+        events = []
+        guests = []
+        for role in ['kharej', 'iran1', 'iran2']:
+            vm = Mock(role=role)
+            vm.check.side_effect = lambda *args, role=role: events.append((role, 'check', args))
+            vm.reboot.side_effect = lambda role=role: events.append((role, 'reboot', ()))
+
+            def ssh(*args, role=role, **kwargs):
+                events.append((role, 'ssh', args))
+                return subprocess.CompletedProcess(args, 0, role + '-old-canonical-bytes\n', '')
+
+            vm.ssh.side_effect = ssh
+            guests.append(vm)
+        record = {'passed': []}
+        runner.profile_upgrade_acceptance(guests, record)
+        expected = [('kharej', 'check', ('upgrade-metadata',)),
+                    ('kharej', 'check', ('upgrade-interrupt',)), ('kharej', 'reboot', ()),
+                    ('kharej', 'check', ('upgrade-recover',)), ('kharej', 'check', ('upgrade',)),
+                    ('iran1', 'check', ('upgrade',))]
+        positions = [events.index(item) for item in expected]
+        self.assertEqual(positions, sorted(positions))
+        for role in ['iran1', 'iran2']:
+            peer_checks = [index for index, item in enumerate(events)
+                           if item[:2] == (role, 'ssh') and item[2][:2] == ('sudo', 'sha256sum')]
+            self.assertEqual(len(peer_checks), 2)
+            self.assertLess(peer_checks[0], positions[0])
+            self.assertGreater(peer_checks[1], positions[-2])
+            self.assertLess(peer_checks[1], positions[-1])
+        self.assertNotIn(('iran2', 'check', ('upgrade',)), events)
+
     def test_checksum_requires_one_exact_filename(self):
         digest = 'a' * 64
         self.assertEqual(runner.image_checksum(digest + ' *noble-server-cloudimg-amd64.img\n',

@@ -24,10 +24,24 @@ class FakeGitHub:
         self.assets = {'gre4.sh': self.files['gre4.sh'],
                        'SHA256SUMS': (hashlib.sha256(self.files['gre4.sh']).hexdigest() + '  gre4.sh\n').encode()}
         self.refs, self.release, self.blobs, self.calls = [], None, {}, []
+        self.visibility_delays = {'create': 0, 'upload': 0, 'publish': 0}
+        self.stale_release, self.stale_reads = None, 0
+        self.read_failures = []
+        self.asset_failures = []
+
+    def delay_visibility(self, operation, previous):
+        self.stale_release = previous
+        self.stale_reads = self.visibility_delays[operation]
+
+    def visible_release(self):
+        if self.stale_reads:
+            self.stale_reads -= 1
+            return self.stale_release
+        return self.release
 
     def existing(self, draft, names=('gre4.sh', 'SHA256SUMS')):
         self.refs = [{'ref': 'refs/tags/' + TAG, 'object': {'type': 'commit', 'sha': SHA}}]
-        self.release = {'tag_name': TAG, 'draft': draft, 'prerelease': False,
+        self.release = {'id': 123, 'tag_name': TAG, 'draft': draft, 'prerelease': False,
                         'target_commitish': SHA, 'assets': []}
         for name in names:
             self.add_asset(name, self.assets[name])
@@ -43,12 +57,19 @@ class FakeGitHub:
             self.assert_source(args[-1])
             return self.files[args[-1].split(':', 1)[1]]
         if args[:2] == ('gh', 'api'):
+            if '--method' not in args and self.read_failures:
+                raise self.read_failures.pop(0)
             if '-H' in args:
+                if self.asset_failures:
+                    raise self.asset_failures.pop(0)
                 return self.blobs[int(args[-1].rsplit('/', 1)[1])]
             endpoint = args[2].removeprefix('repos/' + REPOSITORY + '/')
             if endpoint == 'releases?per_page=100':
                 assert '--paginate' in args and '--slurp' in args
-                return json.dumps([[self.release] if self.release else []]).encode()
+                visible = self.visible_release()
+                return json.dumps([[visible] if visible else []]).encode()
+            if endpoint == 'releases/123':
+                return json.dumps(self.visible_release()).encode()
             if endpoint == 'git/matching-refs/tags/' + TAG:
                 return json.dumps(self.refs).encode()
             if endpoint.startswith('git/tags/'):
@@ -61,20 +82,25 @@ class FakeGitHub:
             assert self.release is None and '--draft' in args and '--verify-tag' in args
             assert args[args.index('--target') + 1] == SHA
             self.notes = Path(args[args.index('--notes-file') + 1]).read_text()
-            self.release = {'tag_name': TAG, 'draft': True, 'prerelease': False,
+            self.release = {'id': 123, 'tag_name': TAG, 'draft': True, 'prerelease': False,
                             'target_commitish': SHA, 'assets': []}
+            self.delay_visibility('create', None)
             return b''
         if args[:3] == ('gh', 'release', 'upload'):
             assert self.release['draft'] and '--clobber' not in args
+            previous = copy.deepcopy(self.release)
             for filename in args[6:]:
                 path = Path(filename)
                 assert path.name not in {item['name'] for item in self.release['assets']}
                 self.add_asset(path.name, path.read_bytes())
+            self.delay_visibility('upload', previous)
             return b''
         if args[:3] == ('gh', 'release', 'edit'):
             assert self.release['draft'] and '--draft=false' in args and '--latest' in args
             assert set(item['name'] for item in self.release['assets']) == set(self.assets)
+            previous = copy.deepcopy(self.release)
             self.release['draft'] = False
+            self.delay_visibility('publish', previous)
             return b''
         raise AssertionError('Unexpected command: ' + repr(args))
 
@@ -92,7 +118,7 @@ class ReleaseTests(unittest.TestCase):
         self.github = FakeGitHub()
 
     def publish(self):
-        with patch.object(release, 'command', side_effect=self.github.command):
+        with patch.object(release, 'command', side_effect=self.github.command), patch.object(release.time, 'sleep'):
             release.publish(Path('/fixture'), REPOSITORY, SHA)
 
     def test_fresh_release_pins_tested_commit_and_verifies_assets_before_publication(self):
@@ -123,6 +149,119 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(len(uploads), 1)
         self.assertEqual([Path(arg).name for arg in uploads[0][6:]], ['SHA256SUMS'])
         self.assertFalse(self.github.release['draft'])
+
+    def test_created_draft_visibility_delay_does_not_repeat_creation(self):
+        self.github.visibility_delays['create'] = 2
+        self.publish()
+        self.assertFalse(self.github.release['draft'])
+        self.assertEqual(sum(args[:3] == ('gh', 'release', 'create') for args in self.github.calls), 1)
+
+    def test_uploaded_asset_visibility_delay_does_not_repeat_upload(self):
+        self.github.existing(draft=True, names=())
+        self.github.visibility_delays['upload'] = 2
+        self.publish()
+        self.assertFalse(self.github.release['draft'])
+        self.assertEqual(sum(args[:3] == ('gh', 'release', 'upload') for args in self.github.calls), 1)
+
+    def test_publication_visibility_delay_does_not_repeat_edit(self):
+        self.github.existing(draft=True)
+        self.github.visibility_delays['publish'] = 2
+        self.publish()
+        self.assertFalse(self.github.release['draft'])
+        self.assertEqual(sum(args[:3] == ('gh', 'release', 'edit') for args in self.github.calls), 1)
+
+    def test_transient_reads_retry_without_replaying_mutations(self):
+        for failure in [subprocess.CalledProcessError(1, ['gh', 'api'], stderr=b'HTTP 502: Bad Gateway'),
+                        subprocess.CalledProcessError(1, ['gh', 'api'], stderr=b'HTTP 429: Too Many Requests'),
+                        subprocess.TimeoutExpired(['gh', 'api'], 30)]:
+            with self.subTest(failure=failure):
+                self.github = FakeGitHub()
+                self.github.read_failures = [failure]
+                self.publish()
+                for operation in ('create', 'upload', 'edit'):
+                    self.assertEqual(sum(args[:3] == ('gh', 'release', operation)
+                                         for args in self.github.calls), 1)
+
+    def test_authentication_and_permission_errors_are_not_retried(self):
+        for code in (401, 403):
+            with self.subTest(code=code):
+                self.github = FakeGitHub()
+                self.github.read_failures = [subprocess.CalledProcessError(
+                    1, ['gh', 'api'], stderr=('HTTP ' + str(code) + ': denied').encode())]
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.publish()
+                self.assertEqual(len(self.github.calls), 4)
+                self.assertEqual(self.github.mutations(), [])
+
+    def test_transient_asset_reads_retry_without_changing_a_published_release(self):
+        self.github.existing(draft=False)
+        previous = copy.deepcopy(self.github.release)
+        self.github.asset_failures = [subprocess.CalledProcessError(
+            1, ['gh', 'api'], stderr=b'HTTP 503: Service Unavailable'),
+            subprocess.TimeoutExpired(['gh', 'api'], 30)]
+        self.publish()
+        self.assertEqual(self.github.asset_failures, [])
+        self.assertEqual(self.github.release, previous)
+        self.assertEqual(self.github.mutations(), [])
+
+    def test_transient_read_retries_stop_without_mutating_when_exhausted(self):
+        self.github.read_failures = [subprocess.CalledProcessError(
+            1, ['gh', 'api'], stderr=b'HTTP 502: Bad Gateway') for _ in range(20)]
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.publish()
+        self.assertEqual(sum(args[:2] == ('gh', 'api') for args in self.github.calls), 5)
+        self.assertEqual(self.github.mutations(), [])
+
+    def test_visibility_wait_is_bounded_and_preserves_an_unseen_draft(self):
+        self.github.visibility_delays['create'] = 100
+        with self.assertRaisesRegex(ValueError, 'Expected draft'):
+            self.publish()
+        self.assertTrue(self.github.release['draft'])
+        self.assertEqual(sum(args[:3] == ('gh', 'release', 'create') for args in self.github.calls), 1)
+        self.assertFalse(any(args[:3] in [('gh', 'release', 'upload'), ('gh', 'release', 'edit')]
+                             for args in self.github.calls))
+        self.assertEqual(sum(args[:3] == ('gh', 'api', 'repos/' + REPOSITORY + '/releases?per_page=100')
+                             for args in self.github.calls), 8)
+
+    def test_wrong_target_observed_after_create_is_not_waited_away(self):
+        def command(*args):
+            result = self.github.command(*args)
+            if args[:3] == ('gh', 'release', 'create'):
+                self.github.release['target_commitish'] = 'b' * 40
+            return result
+        with patch.object(release, 'command', side_effect=command), patch.object(release.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError, 'unexpected target'):
+                release.publish(Path('/fixture'), REPOSITORY, SHA)
+        sleep.assert_not_called()
+        self.assertFalse(any(args[:3] == ('gh', 'release', 'upload') for args in self.github.calls))
+
+    def test_mutation_timeout_is_not_retried_and_next_run_reconciles_existing_state(self):
+        for operation in ('create', 'upload', 'edit'):
+            with self.subTest(operation=operation):
+                self.github = FakeGitHub()
+
+                def command(*args):
+                    result = self.github.command(*args)
+                    if args[:3] == ('gh', 'release', operation):
+                        # GitHub applied the mutation, but the response was lost.
+                        raise subprocess.TimeoutExpired(args, 30)
+                    return result
+
+                with patch.object(release, 'command', side_effect=command), patch.object(release.time, 'sleep'):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        release.publish(Path('/fixture'), REPOSITORY, SHA)
+                self.assertEqual(sum(args[:3] == ('gh', 'release', operation)
+                                     for args in self.github.calls), 1)
+                self.publish()
+                self.assertFalse(self.github.release['draft'])
+                self.assertEqual(sum(args[:3] == ('gh', 'release', operation)
+                                     for args in self.github.calls), 1)
+
+    def test_published_retry_uses_tag_identity_when_target_is_a_branch_name(self):
+        self.github.existing(draft=False)
+        self.github.release['target_commitish'] = 'main'
+        self.publish()
+        self.assertEqual(self.github.mutations(), [])
 
     def test_corrupt_uploaded_bytes_keep_the_release_unpublished(self):
         def command(*args):

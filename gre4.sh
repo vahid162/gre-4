@@ -1038,26 +1038,240 @@ profile_status() (
   warn "Service/interface status is local only. Test peer reachability and real TCP/UDP traffic separately."
 )
 
+operator_help() {
+  cat <<'HELP'
+Usage: sudo bash ./gre4.sh [command]
+  (no command)          Verify the latest release, upgrade if needed, and open the menu
+  --status              Show installed release and local connection state (read-only)
+  --doctor              Inspect local prerequisites and recovery state (read-only)
+  --backups             List upgrade backups (read-only)
+  --recover [backup]    Verify the latest release and request guarded recovery
+  --help                Show this help without downloading or changing anything
+Read-only commands do not upgrade, restart connections, or repair the firewall.
+HELP
+}
+
+operator_read_release_record() {
+  local tag helper unit manager extra
+  legacy_safe_path "$RELEASE_STAMP_FILE" || { err 'Unsafe installed-release record path.'; return 1; }
+  private_config_file "$RELEASE_STAMP_FILE" || return
+  read -r tag helper unit manager extra < "$RELEASE_STAMP_FILE" || return
+  release_tag_valid "$tag" && [[ "$helper" =~ ^[0-9a-f]{64}$ && "$unit" =~ ^[0-9a-f]{64}$ &&
+    "$manager" =~ ^[0-9a-f]{64}$ && -z "$extra" && $(wc -l < "$RELEASE_STAMP_FILE") == 1 ]] || {
+    err "Invalid installed-release record: $RELEASE_STAMP_FILE"; return 1;
+  }
+  cmp -s "$RELEASE_STAMP_FILE" <(printf '%s %s %s %s\n' "$tag" "$helper" "$unit" "$manager") || {
+    err "Invalid installed-release record: $RELEASE_STAMP_FILE"; return 1;
+  }
+  printf '%s %s %s %s\n' "$tag" "$helper" "$unit" "$manager"
+}
+
+operator_status() (
+  local record file id active enabled addresses failed=0 found=0
+  local tag helper unit manager
+  if [[ -e "$RELEASE_STAMP_FILE" || -L "$RELEASE_STAMP_FILE" ]]; then
+    record=$(operator_read_release_record) || return
+    read -r tag helper unit manager <<< "$record"
+    printf 'Installed release: %s (recorded locally)\n' "$tag"
+  else
+    echo 'Installed release: not recorded; an older installation may still exist.'
+  fi
+  if [[ -e "$LEGACY_CONF_FILE" || -L "$LEGACY_CONF_FILE" || -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+    echo 'Legacy singleton artifacts are present; inspect migration/recovery before changing profiles.'
+  fi
+  for file in "$MIGRATION_BACKUP_DIR/upgrade-pending" "$MIGRATION_BACKUP_DIR/pending"; do
+    if [[ -e "$file" || -L "$file" ]]; then
+      printf 'Recovery pending: %s\n' "$file"
+    fi
+  done
+  upgrade_safe_directory "$PROFILE_DIR" || { err "Unsafe profile directory: $PROFILE_DIR"; return 1; }
+  shopt -s nullglob
+  for file in "$PROFILE_DIR"/*.conf; do
+    found=1
+    id=${file##*/}; id=${id%.conf}
+    if ! load_profile "$id"; then failed=1; continue; fi
+    active=unavailable; enabled=unavailable
+    if command -v systemctl >/dev/null 2>&1; then
+      active=$(systemctl show --property=ActiveState --value "gre4@$id.service") || { active=unavailable; failed=1; }
+      enabled=$(systemctl show --property=UnitFileState --value "gre4@$id.service") || { enabled=unavailable; failed=1; }
+    else
+      failed=1
+    fi
+    printf '\nConnection: %s\nRole: %s\nService: %s; boot: %s\nPublic endpoints: %s -> %s\nTunnel: %s (%s / %s)\nPorts: %s; UDP: %s\n' \
+      "$id" "$ROLE" "$active" "$enabled" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$TUN_IF" \
+      "$IRAN_TUN_CIDR" "$KHAREJ_TUN_CIDR" "$SERVICE_PORTS" "$ALLOW_UDP"
+    if command -v ip >/dev/null 2>&1; then
+      if addresses=$(ip -o -4 addr show dev "$TUN_IF" 2>/dev/null); then
+        printf '%s\n' "$addresses"
+      else
+        echo 'Interface: absent or unreadable.'
+      fi
+    else
+      echo 'Interface: ip command unavailable.'
+    fi
+    if [[ -e "$STATE_DIR/profiles/$id/cleanup-pending" || -L "$STATE_DIR/profiles/$id/cleanup-pending" ]]; then
+      echo 'Connection cleanup pending; retain its recovery files.'
+    fi
+  done
+  [[ "$found" != 0 ]] || echo 'No connection profiles found.'
+  echo 'Local observations only; peer reachability and application traffic are not tested.'
+  return "$failed"
+)
+
+operator_doctor() (
+  local file command_name value record tag helper unit manager actual id active failed=0 need_iptables=0 need_conntrack=0
+  operator_status || failed=1
+  upgrade_safe_directory "$PROFILE_DIR" && upgrade_safe_directory "$STATE_DIR" || return 1
+  echo
+  echo 'Read-only prerequisite checks:'
+  shopt -s nullglob
+  for file in "$PROFILE_DIR"/*.conf; do
+    if ! read_profile_file "$file"; then failed=1; continue; fi
+    if [[ "$ROLE" == iran ]]; then need_iptables=1; else need_conntrack=1; fi
+    id=${file##*/}; id=${id%.conf}
+    if command -v ip >/dev/null 2>&1; then check_local_public_ip "$LOCAL_PUBLIC_IP" || failed=1; fi
+    if command -v systemctl >/dev/null 2>&1; then
+      active=$(systemctl show --property=ActiveState --value "gre4@$id.service") || { failed=1; continue; }
+      if [[ "$active" == active ]]; then
+        # This helper only reads applied state and interface ownership; preflight can load modules.
+        if command -v ip >/dev/null 2>&1 && ! upgrade_verify_health "$id"; then
+          printf 'Local connection health mismatch: %s\n' "$id"; failed=1
+        fi
+      elif [[ -e "$STATE_DIR/profiles/$id/applied.conf" || -L "$STATE_DIR/profiles/$id/applied.conf" ||
+              -e "$STATE_DIR/profiles/$id/cleanup-pending" || -L "$STATE_DIR/profiles/$id/cleanup-pending" ]]; then
+        printf 'Inactive connection retains applied state: %s\n' "$id"; failed=1
+      fi
+    fi
+  done
+  for command_name in ip systemctl sysctl sha256sum; do
+    if command -v "$command_name" >/dev/null 2>&1; then printf '%s: available\n' "$command_name"
+    else printf '%s: missing\n' "$command_name"; failed=1; fi
+  done
+  if [[ "$need_iptables" == 1 ]]; then
+    if command -v iptables >/dev/null 2>&1; then echo 'iptables: available'
+    else echo 'iptables: missing for the Iran role'; failed=1; fi
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    if value=$(sysctl -n net.ipv4.ip_forward 2>/dev/null); then printf 'IPv4 forwarding: %s\n' "$value"
+    else echo 'IPv4 forwarding: unreadable'; failed=1; fi
+    if [[ "$need_conntrack" == 1 ]]; then
+      if value=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null); then printf 'Kharej conntrack limit: %s\n' "$value"
+      else echo 'Kharej conntrack key: unavailable; no module was loaded by this check.'; failed=1; fi
+    fi
+  fi
+  if [[ -d /sys/module/ip_gre ]]; then echo 'GRE module: currently loaded'
+  else echo 'GRE module: not observed as loaded; kernel availability is not tested.'; fi
+  if command -v ufw >/dev/null 2>&1; then
+    if value=$(LC_ALL=C ufw status); then printf 'UFW observation:\n%s\n' "$value"
+    else echo 'UFW: status unreadable'; failed=1; fi
+  else
+    echo 'UFW: not installed (optional)'
+  fi
+  if [[ -e "$RELEASE_STAMP_FILE" || -L "$RELEASE_STAMP_FILE" ]]; then
+    if record=$(operator_read_release_record); then
+      read -r tag helper unit manager <<< "$record"
+      for file in "$APPLY_SCRIPT" "$TEMPLATE_FILE"; do
+        if ! legacy_owned_file "$file"; then printf 'Installed file is unsafe: %s\n' "$file"; failed=1; continue; fi
+        actual=$(sha256sum "$file") || { failed=1; continue; }
+        if [[ ( "$file" == "$APPLY_SCRIPT" && ${actual%% *} == "$helper" ) ||
+              ( "$file" == "$TEMPLATE_FILE" && ${actual%% *} == "$unit" ) ]]; then
+          printf 'Installed file matches release record: %s\n' "$file"
+        else
+          printf 'Installed file differs from release record: %s\n' "$file"; failed=1
+        fi
+      done
+    else
+      failed=1
+    fi
+  fi
+  echo 'GRE uses IP protocol 47. Provider filtering and destination listeners need separate checks.'
+  return "$failed"
+)
+
+operator_prompt_input() {
+  local label="$1" default="$2" value
+  if ! IFS= read -r -p "$label [$default]: " value; then
+    err 'Input ended; connection setup cancelled before configuration was written.'
+    return 1
+  fi
+  printf '%s\n' "${value:-$default}"
+}
+
+operator_add_host_policy() (
+  local wanted_role="$1" wanted_ip="${2:-}" file
+  legacy_safe_path "$PROFILE_DIR" && legacy_safe_path "$STATE_DIR/profiles" || return 1
+  shopt -s nullglob
+  for file in "$PROFILE_DIR"/*.conf "$STATE_DIR"/profiles/*/applied.conf; do
+    read_profile_file "$file" || return
+    [[ "$ROLE" == "$wanted_role" ]] || {
+      err "This host already uses role $ROLE; choose that role from the main menu."; return 1;
+    }
+    [[ -z "$wanted_ip" || "$LOCAL_PUBLIC_IP" == "$wanted_ip" ]] || {
+      err "Existing connections use local public IPv4 $LOCAL_PUBLIC_IP."; return 1;
+    }
+  done
+)
+
+operator_peer_available() (
+  local peer="$1" file
+  shopt -s nullglob
+  for file in "$PROFILE_DIR"/*.conf "$STATE_DIR"/profiles/*/applied.conf; do
+    read_profile_file "$file" || return
+    [[ "$PEER_PUBLIC_IP" != "$peer" ]] || { err 'This peer already has a connection; enter a different peer.'; return 1; }
+  done
+)
+
 add_profile_interactive() (
-  local role="$1" id local_ip peer ports udp subnet
+  local role="$1" id local_ip peer ports udp subnet suggested base _last
+  [[ "$role" == iran || "$role" == kharej ]] || { err 'Invalid connection role.'; return 1; }
   acquire_management_lock && profile_normal_mutation_allowed || return
-  id=$(prompt_default "Connection ID (lowercase, at most 10 characters)" "iran1")
-  validate_profile_id "$id" || { err "Invalid connection ID."; return 1; }
-  [[ ! -e "$PROFILE_DIR/$id.conf" ]] || { err "Connection already exists: $id"; return 1; }
-  local_ip=$(prompt_default "This server's public IPv4" "")
-  peer=$(prompt_default "Other server's public IPv4" "")
-  ports=$(prompt_default "Service ports (comma-separated)" "2096")
-  udp=$(prompt_default "Forward/allow UDP too? (yes/no)" "no")
-  subnet=$(prompt_default "Tunnel /30 network (use the SAME network at both ends)" "$(suggest_profile_subnet)")
+  operator_add_host_policy "$role" || return
+  while true; do
+    id=$(operator_prompt_input 'Connection ID (lowercase, at most 10 characters)' iran1) || return
+    if ! validate_profile_id "$id"; then err 'Invalid connection ID. Example: iran2 (lowercase ASCII, at most 10 characters).'; continue; fi
+    if [[ -e "$PROFILE_DIR/$id.conf" || -L "$PROFILE_DIR/$id.conf" ]]; then err "Connection already exists: $id. Choose a different ID."; continue; fi
+    break
+  done
+  while true; do
+    local_ip=$(operator_prompt_input "This server's public IPv4" '') || return
+    if ! validate_ipv4 "$local_ip"; then err 'Invalid local IPv4. Example: 198.51.100.1'; continue; fi
+    local_ip=$(number_ipv4 "$(ipv4_number "$local_ip")") || return
+    check_local_public_ip "$local_ip" && operator_add_host_policy "$role" "$local_ip" && break
+  done
+  while true; do
+    peer=$(operator_prompt_input "Other server's public IPv4" '') || return
+    if ! validate_ipv4 "$peer"; then err 'Invalid peer IPv4. Example: 192.0.2.10'; continue; fi
+    peer=$(number_ipv4 "$(ipv4_number "$peer")") || return
+    if [[ "$peer" == "$local_ip" ]]; then err 'Peer IPv4 must differ from this server.'; continue; fi
+    operator_peer_available "$peer" && break
+  done
+  while true; do
+    ports=$(operator_prompt_input 'Service ports (comma-separated)' 2096) || return
+    if ports=$(normalize_ports_list "$ports"); then break; fi
+    err 'Enter ports between 1 and 65535, for example 443,2096.'
+  done
+  while true; do
+    udp=$(operator_prompt_input 'Forward/allow UDP too? (yes/no)' no) || return
+    [[ "$udp" != yes && "$udp" != no ]] || break
+    err 'Enter yes or no for UDP.'
+  done
+  suggested=$(suggest_profile_subnet) || return
+  while true; do
+    subnet=$(operator_prompt_input 'Tunnel /30 network (use the SAME network at both ends)' "$suggested") || return
+    if render_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet" >/dev/null; then break; fi
+    err 'Choose an aligned /30 network without profile or host-route conflicts.'
+  done
+  read -r base _last < <(cidr_bounds "$subnet")
+  printf 'Planned connection:\nID: %s\nRole: %s\nPublic endpoints: %s -> %s\nIran tunnel: %s/30\nKharej tunnel: %s/30\nPorts: %s; UDP: %s\n' \
+    "$id" "$role" "$local_ip" "$peer" "$(number_ipv4 "$((base+1))")" "$(number_ipv4 "$((base+2))")" "$ports" "$udp"
   ( ROLE="$role"; profile_preflight ) || return 1
   profile_runtime_lock || return
   write_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet" || return
   flock -u 8; exec 8>&-
   install_apply_script && install_profile_unit || return
-  if ! systemctl enable "gre4@$id.service" ||
-      ! systemctl start "gre4@$id.service" ||
+  if ! systemctl enable "gre4@$id.service" || ! systemctl start "gre4@$id.service" ||
       ! systemctl is-active --quiet "gre4@$id.service"; then
-    err "Connection setup failed; configuration retained. Inspect status and retry Stop before Start."
+    err 'Connection setup failed; configuration retained. Inspect status and retry Stop before Start.'
     return 1
   fi
   record_installed_release || return
@@ -1068,6 +1282,7 @@ add_profile_interactive() (
     warn "The destination application must listen on $KHAREJ_TUN_CIDR (without /30) or an appropriate wildcard address. Its configuration is not changed."
   fi
 )
+
 
 manage_profile_menu() {
   local id choice ports udp local_ip peer subnet
@@ -1681,6 +1896,452 @@ upgrade_prepare_artifacts() (
   record_installed_release
 )
 
+upgrade_same_runtime() {
+  cmp -s "$1/gre4-apply.sh" "$1/new-helper" && cmp -s "$1/gre4@.service" "$1/new-unit"
+}
+
+upgrade_verify_unmarked_pair() {
+  local digest
+  legacy_owned_file "$1" && [[ -x "$1" ]] && legacy_owned_file "$2" || return 1
+  digest=$(sha256sum "$1") || return
+  case "${digest%% *}" in
+    "$UPGRADE_V111_HELPER_SHA256"|"$UPGRADE_V111_BASH51_HELPER_SHA256") ;;
+    *) err "Installed helper is unknown; automatic upgrade refused."; return 1 ;;
+  esac
+  # Keep this historical template separate from the current unit renderer.
+  cmp -s "$2" <(cat <<EOF_UNIT
+[Unit]
+Description=GRE4 connection %i
+Wants=network-online.target
+After=network-online.target ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+ExecStart=$APPLY_SCRIPT start %i
+ExecStopPost=$APPLY_SCRIPT post-stop %i
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+  ) || { err "Unrecognized GRE4 service template; automatic upgrade refused."; return 1; }
+}
+
+upgrade_recovery_targets() {
+  printf '%s\n' "$APPLY_SCRIPT" "$TEMPLATE_FILE" "$RELEASE_STAMP_FILE" "$PROFILE_DIR" "$STATE_DIR" \
+    "$SYSCTL_DIR" "$UFW_DIR" "$UFW_BEFORE_FILE" "$UFW_DEFAULTS_FILE" "$LOCK_DIR" "$MIGRATION_BACKUP_DIR"
+}
+
+upgrade_validate_intent() {
+  local line id
+  local -A seen=()
+  private_config_file "$1/intent" || return
+  # All consumers use newline-delimited records; reject an incomplete final one.
+  [[ ! -s "$1/intent" || $(tail -c 1 "$1/intent" | wc -l) == 1 ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([a-z][a-z0-9_-]{0,9})\ (active|inactive)\ (enabled|disabled)$ ]] || return 1
+    id=${BASH_REMATCH[1]}
+    [[ ! ${seen[$id]:-} ]] || return 1
+    seen[$id]=1
+  done < "$1/intent"
+}
+
+upgrade_recovery_file_list() {
+  local backup="$1" id active enabled
+  upgrade_validate_intent "$backup" || return
+  printf '%s\n' recovery-format created-at targets kind intent gre4-apply.sh gre4@.service new-helper new-unit new-release
+  [[ ! -e "$backup/release" && ! -L "$backup/release" ]] || printf '%s\n' release
+  while read -r id active enabled; do printf 'profiles/%s.conf\n' "$id"; done < "$backup/intent"
+}
+
+upgrade_recovery_checksums() {
+  local backup="$1" files file
+  files=$(upgrade_recovery_file_list "$backup") || return
+  (
+    cd -- "$backup" || return
+    while IFS= read -r file; do
+      legacy_owned_file "$backup/$file" || return
+      sha256sum -- "$file" || return
+    done <<< "$files"
+  )
+}
+
+upgrade_prepare_recovery() {
+  local backup="$1" staged kind=runtime
+  upgrade_same_runtime "$backup" && kind=metadata
+  printf '1\n' > "$backup/recovery-format" &&
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$backup/created-at" &&
+    upgrade_recovery_targets > "$backup/targets" &&
+    printf '%s\n' "$kind" > "$backup/kind" || return
+  chmod 700 "$backup/profiles" || return
+  chmod 600 "$backup/recovery-format" "$backup/created-at" "$backup/targets" "$backup/kind" || return
+  staged=$(mktemp "$backup/.checksums.XXXXXX") || return
+  if ! upgrade_recovery_checksums "$backup" > "$staged" ||
+      ! chmod 600 "$staged" || ! mv -f "$staged" "$backup/recovery.sha256"; then
+    rm -f "$staged"; return 1
+  fi
+}
+
+upgrade_backup_path() {
+  local candidate="$1" root="$MIGRATION_BACKUP_DIR" name
+  if [[ "$candidate" == "$root/"* ]]; then name=${candidate#"$root/"}; else name="$candidate"; fi
+  [[ "$name" =~ ^upgrade\.[a-zA-Z0-9]+$ ]] || { err "Invalid backup ID."; return 1; }
+  printf '%s/%s\n' "$root" "$name"
+}
+
+upgrade_private_backup_directory() {
+  local mode
+  legacy_safe_path "$1" && [[ -d "$1" && -O "$1" ]] || return 1
+  mode=$(stat -c %a "$1") || return
+  (( (8#$mode & 077) == 0 ))
+}
+
+upgrade_verify_release_record() {
+  local record="$1" helper="$2" unit="$3" tag helper_hash unit_hash manager_hash extra actual_helper actual_unit
+  private_config_file "$record" || return
+  read -r tag helper_hash unit_hash manager_hash extra < "$record" || return
+  release_tag_valid "$tag" && [[ "$helper_hash" =~ ^[0-9a-f]{64}$ &&
+    "$unit_hash" =~ ^[0-9a-f]{64}$ && "$manager_hash" =~ ^[0-9a-f]{64}$ && -z "$extra" ]] || return 1
+  cmp -s "$record" <(printf '%s %s %s %s\n' "$tag" "$helper_hash" "$unit_hash" "$manager_hash") || return 1
+  actual_helper=$(sha256sum "$helper") && actual_unit=$(sha256sum "$unit") || return
+  [[ "$helper_hash" == "${actual_helper%% *}" && "$unit_hash" == "${actual_unit%% *}" ]]
+}
+
+upgrade_validate_backup() {
+  local backup="$1" file kind stage captured checksums id active enabled count=0
+  [[ "$(upgrade_backup_path "$backup")" == "$backup" ]] || return 1
+  upgrade_private_backup_directory "$MIGRATION_BACKUP_DIR" &&
+    upgrade_private_backup_directory "$backup" &&
+    upgrade_private_backup_directory "$backup/profiles" || return 1
+  for file in recovery-format created-at targets kind stage recovery.sha256 intent new-release; do
+    private_config_file "$backup/$file" || return
+  done
+  cmp -s "$backup/recovery-format" <(printf '1\n') || {
+    err "This backup needs manual recovery; read its RECOVERY.txt."; return 1;
+  }
+  cmp -s "$backup/targets" <(upgrade_recovery_targets) || {
+    err "Backup installation paths do not match this host."; return 1;
+  }
+  read -r kind < "$backup/kind" && [[ "$kind" == metadata || "$kind" == runtime ]] || return 1
+  cmp -s "$backup/kind" <(printf '%s\n' "$kind") || return 1
+  read -r captured < "$backup/created-at" &&
+    [[ "$captured" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+  read -r stage < "$backup/stage" || return
+  case "$stage" in prepared|stopping|old-clean|new-installed|rollback-cleanup|metadata-only|metadata-rollback|complete|rolled-back) ;; *) return 1 ;; esac
+  cmp -s "$backup/stage" <(printf '%s\n' "$stage") || return 1
+  upgrade_validate_intent "$backup" || return
+  for file in gre4-apply.sh gre4@.service new-helper new-unit; do legacy_owned_file "$backup/$file" || return; done
+  [[ -x "$backup/gre4-apply.sh" && -x "$backup/new-helper" ]] || return 1
+  while read -r id active enabled; do
+    private_config_file "$backup/profiles/$id.conf" || return
+    count=$((count+1))
+  done < "$backup/intent"
+  for file in "$backup/profiles"/*; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    [[ "$file" == *.conf && ! -L "$file" && -f "$file" ]] || return 1
+    count=$((count-1))
+  done
+  [[ "$count" == 0 ]] || return 1
+  checksums=$(upgrade_recovery_checksums "$backup") || return
+  cmp -s "$backup/recovery.sha256" <(printf '%s\n' "$checksums") || {
+    err "Backup files changed; preserving them for manual recovery."; return 1;
+  }
+  upgrade_verify_release_record "$backup/new-release" "$backup/new-helper" "$backup/new-unit" || return
+  if [[ -e "$backup/release" || -L "$backup/release" ]]; then
+    upgrade_verify_release_record "$backup/release" "$backup/gre4-apply.sh" "$backup/gre4@.service" || return
+  else
+    upgrade_verify_unmarked_pair "$backup/gre4-apply.sh" "$backup/gre4@.service" || return
+  fi
+  if [[ "$kind" == metadata ]]; then upgrade_same_runtime "$backup" || return 1; fi
+}
+
+upgrade_pending_backup() {
+  local backup
+  private_config_file "$MIGRATION_BACKUP_DIR/upgrade-pending" || return
+  read -r backup < "$MIGRATION_BACKUP_DIR/upgrade-pending" || return
+  [[ "$(upgrade_backup_path "$backup")" == "$backup" ]] || return 1
+  cmp -s "$MIGRATION_BACKUP_DIR/upgrade-pending" <(printf '%s\n' "$backup") || return 1
+  printf '%s\n' "$backup"
+}
+
+upgrade_publish_pending() {
+  local backup="$1" staged
+  [[ ! -e "$MIGRATION_BACKUP_DIR/upgrade-pending" && ! -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]] || return 1
+  staged=$(mktemp "$MIGRATION_BACKUP_DIR/.upgrade-pending.XXXXXX") || return
+  if ! printf '%s\n' "$backup" > "$staged" || ! chmod 600 "$staged" ||
+      ! mv -f "$staged" "$MIGRATION_BACKUP_DIR/upgrade-pending"; then
+    rm -f "$staged"; return 1
+  fi
+}
+
+upgrade_verify_record_ownership() {
+  local backup="$1"
+  if [[ -e "$RELEASE_STAMP_FILE" || -L "$RELEASE_STAMP_FILE" ]]; then
+    private_config_file "$RELEASE_STAMP_FILE" || return
+    { { [[ -f "$backup/release" ]] && cmp -s "$RELEASE_STAMP_FILE" "$backup/release"; } ||
+      cmp -s "$RELEASE_STAMP_FILE" "$backup/new-release"; } || return 1
+  else
+    [[ ! -e "$backup/release" ]]
+  fi
+}
+
+upgrade_restore_record() {
+  local backup="$1"
+  upgrade_verify_record_ownership "$backup" || return
+  if [[ -f "$backup/release" ]]; then
+    migration_restore_file "$backup/release" "$RELEASE_STAMP_FILE"
+  else
+    rm -f "$RELEASE_STAMP_FILE"
+  fi
+}
+
+upgrade_metadata_rollback() {
+  local backup="$1"
+  upgrade_verify_profiles_unchanged "$backup" &&
+    cmp -s "$APPLY_SCRIPT" "$backup/gre4-apply.sh" &&
+    cmp -s "$TEMPLATE_FILE" "$backup/gre4@.service" && upgrade_verify_record_ownership "$backup" || return 1
+  migration_set_stage "$backup" metadata-rollback || return
+  upgrade_restore_record "$backup" || return
+  migration_set_stage "$backup" rolled-back || return
+  rm -f "$MIGRATION_BACKUP_DIR/upgrade-pending" || return
+  log "Previous release record restored; connections were not restarted. Backup: $backup"
+}
+
+upgrade_metadata_apply() {
+  local backup="$1"
+  migration_set_stage "$backup" metadata-only || return
+  upgrade_verify_profiles_unchanged "$backup" &&
+    cmp -s "$APPLY_SCRIPT" "$backup/new-helper" &&
+    cmp -s "$TEMPLATE_FILE" "$backup/new-unit" && upgrade_verify_record_ownership "$backup" || return 1
+  migration_restore_file "$backup/new-release" "$RELEASE_STAMP_FILE" || return
+  migration_set_stage "$backup" complete || return
+  rm -f "$MIGRATION_BACKUP_DIR/upgrade-pending" || return
+  log "Installed $GRE4_RELEASE_TAG; runtime unchanged, connections were not restarted. Backup: $backup"
+}
+
+upgrade_verify_recovery_units() {
+  local backup="$1" pending="$2" paths path file unit id active enabled current_active current_enabled link
+  local fragment dropins reload kind stage
+  local -a load_paths
+  read -r kind < "$backup/kind" || return
+  read -r stage < "$backup/stage" || return
+  # A finished rollback with only its pending marker left needs no new cutover.
+  [[ "$stage" != rolled-back ]] || pending=no
+  paths=$(systemctl show --property=UnitPath --value) || return
+  [[ -n "$paths" ]] || return 1
+  read -r -a load_paths <<< "$paths"
+  while read -r id active enabled; do
+    unit="gre4@$id.service"
+    current_active=$(systemctl show --property=ActiveState --value "$unit") || return
+    current_enabled=$(systemctl show --property=UnitFileState --value "$unit") || return
+    case "$current_active" in active|inactive|failed) ;; *) return 1 ;; esac
+    if [[ "$pending" == no || "$kind" == metadata ]]; then
+      [[ "$current_active" == "$active" && "$current_enabled" == "$enabled" ]] || {
+        err "Service intent changed for $id; manual recovery is required."; return 1;
+      }
+    fi
+    if [[ "$current_enabled" == masked ]]; then
+      [[ "$pending" == yes && "$kind" == runtime ]] || return 1
+      file="${TEMPLATE_FILE%/*}/$unit"
+      [[ -L "$file" && $(stat -c %u "$file") == "$EUID" && $(readlink "$file") == /dev/null ]] || {
+        err "Unrecognized mask for $id; it was not removed."; return 1;
+      }
+    else
+      [[ "$current_enabled" == "$enabled" ]] || return 1
+      fragment=$(systemctl show --property=FragmentPath --value "$unit") || return
+      dropins=$(systemctl show --property=DropInPaths --value "$unit") || return
+      reload=$(systemctl show --property=NeedDaemonReload --value "$unit") || return
+      [[ "$fragment" == "$TEMPLATE_FILE" && -z "$dropins" && ( "$reload" == no ||
+        ( "$pending" == yes && "$kind" == runtime && "$reload" == yes ) ) ]] || return 1
+    fi
+    for path in "${load_paths[@]}"; do
+      [[ "$path" == /* ]] || return 1
+      for file in "$path/$unit" "$path/gre4@.service"; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        if [[ "$file" == "$TEMPLATE_FILE" ]]; then continue; fi
+        [[ "$file" == "${TEMPLATE_FILE%/*}/$unit" && "$current_enabled" == masked ]] || {
+          err "Custom unit file blocks recovery: $file"; return 1;
+        }
+      done
+      for file in "$path"/service.d "$path"/gre4*.service.d; do
+        [[ ! -e "$file" && ! -L "$file" ]] || { err "Unit overrides block recovery: $file"; return 1; }
+      done
+      for link in "$path"/*.wants/"$unit" "$path"/*.requires/"$unit"; do
+        [[ -e "$link" || -L "$link" ]] || continue
+        [[ "$enabled" == enabled && "$link" == "${TEMPLATE_FILE%/*}/multi-user.target.wants/$unit" &&
+          -L "$link" && $(readlink -f "$link") == "$TEMPLATE_FILE" ]] || {
+          err "Boot intent changed for $id; manual recovery is required."; return 1;
+        }
+      done
+    done
+    if [[ "$enabled" == enabled ]]; then
+      link="${TEMPLATE_FILE%/*}/multi-user.target.wants/$unit"
+      [[ -L "$link" && $(readlink -f "$link") == "$TEMPLATE_FILE" ]] || return 1
+    fi
+    if [[ "$pending" == no || "$kind" == metadata ]]; then
+      if [[ "$active" == active ]]; then upgrade_verify_health "$id" || return
+      else [[ ! -e "$STATE_DIR/profiles/$id/applied.conf" && ! -L "$STATE_DIR/profiles/$id/applied.conf" &&
+        ! -e "$STATE_DIR/profiles/$id/cleanup-pending" && ! -L "$STATE_DIR/profiles/$id/cleanup-pending" ]] || return 1; fi
+    fi
+  done < "$backup/intent"
+}
+
+upgrade_validate_recovery_current() {
+  local backup="$1" pending="$2" file state_entries id units unit extra stage kind
+  upgrade_validate_backup "$backup" || return
+  for file in "$PROFILE_DIR" "$STATE_DIR" "$LOCK_DIR" "$MIGRATION_BACKUP_DIR" \
+      "${APPLY_SCRIPT%/*}" "${TEMPLATE_FILE%/*}" "${RELEASE_STAMP_FILE%/*}"; do
+    upgrade_safe_directory "$file" || return
+  done
+  for file in "$APPLY_SCRIPT" "$TEMPLATE_FILE" "$RELEASE_STAMP_FILE"; do legacy_safe_path "$file" || return; done
+  [[ ! -e "$LEGACY_CONF_FILE" && ! -L "$LEGACY_CONF_FILE" &&
+     ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" &&
+     ! -e "$MIGRATION_BACKUP_DIR/pending" && ! -L "$MIGRATION_BACKUP_DIR/pending" ]] || return 1
+  if [[ -d "$STATE_DIR" ]]; then
+    state_entries=$(find "$STATE_DIR" -type l -print -quit) || return
+    [[ -z "$state_entries" ]] || return 1
+  fi
+  upgrade_verify_profiles_unchanged "$backup" || return
+  # Shared runtime cleanup cannot safely run alongside an unrecognized instance.
+  for file in "$STATE_DIR"/profiles/*; do
+    [[ -d "$file" && ! -L "$file" && -O "$file" ]] || return 1
+    id=${file##*/}
+    validate_profile_id "$id" && [[ -f "$backup/profiles/$id.conf" ]] || return 1
+  done
+  units=$(systemctl list-units --all --plain --no-legend 'gre4@*.service') || return
+  while read -r unit extra; do
+    [[ -n "$unit" ]] || continue
+    upgrade_verify_listed_unit "$unit" || return
+  done <<< "$units"
+  units=$(systemctl list-unit-files --no-legend) || return
+  while read -r unit extra; do
+    [[ "$unit" == gre4@*.service ]] || continue
+    upgrade_verify_listed_unit "$unit" || return
+  done <<< "$units"
+  legacy_owned_file "$APPLY_SCRIPT" && legacy_owned_file "$TEMPLATE_FILE" || return 1
+  read -r stage < "$backup/stage" && read -r kind < "$backup/kind" || return
+  case "$kind:$stage" in
+    metadata:prepared|metadata:metadata-only|metadata:metadata-rollback|metadata:complete|metadata:rolled-back|\
+    runtime:prepared|runtime:stopping|runtime:old-clean|runtime:new-installed|runtime:rollback-cleanup|runtime:complete|runtime:rolled-back) ;;
+    *) return 1 ;;
+  esac
+  if [[ "$pending" == no ]]; then
+    [[ "$stage" == complete ]] || return 1
+    cmp -s "$APPLY_SCRIPT" "$backup/new-helper" && cmp -s "$TEMPLATE_FILE" "$backup/new-unit" &&
+      private_config_file "$RELEASE_STAMP_FILE" && cmp -s "$RELEASE_STAMP_FILE" "$backup/new-release" || return 1
+  else
+    { cmp -s "$APPLY_SCRIPT" "$backup/gre4-apply.sh" || cmp -s "$APPLY_SCRIPT" "$backup/new-helper"; } &&
+      { cmp -s "$TEMPLATE_FILE" "$backup/gre4@.service" || cmp -s "$TEMPLATE_FILE" "$backup/new-unit"; } &&
+      upgrade_verify_record_ownership "$backup" || return 1
+    case "$stage" in
+      prepared|stopping|rolled-back)
+        cmp -s "$APPLY_SCRIPT" "$backup/gre4-apply.sh" && cmp -s "$TEMPLATE_FILE" "$backup/gre4@.service" || return 1 ;;
+      new-installed|complete)
+        cmp -s "$APPLY_SCRIPT" "$backup/new-helper" && cmp -s "$TEMPLATE_FILE" "$backup/new-unit" || return 1 ;;
+    esac
+    case "$stage" in
+      prepared|stopping|old-clean|rolled-back)
+        if [[ -f "$backup/release" ]]; then cmp -s "$RELEASE_STAMP_FILE" "$backup/release" || return
+        else [[ ! -e "$RELEASE_STAMP_FILE" && ! -L "$RELEASE_STAMP_FILE" ]] || return 1; fi ;;
+      complete) cmp -s "$RELEASE_STAMP_FILE" "$backup/new-release" || return ;;
+    esac
+  fi
+  upgrade_verify_recovery_units "$backup" "$pending"
+}
+
+recover_upgrade_backup() (
+  local backup="$1" pending=no current stage kind
+  acquire_management_lock && profile_runtime_lock || return
+  UPGRADE_RUNTIME_LOCKED=1
+  shopt -s nullglob
+  if [[ -e "$MIGRATION_BACKUP_DIR/upgrade-pending" || -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]]; then
+    current=$(upgrade_pending_backup) || return
+    [[ "$current" == "$backup" ]] || { err "A different upgrade is pending; it was not changed."; return 1; }
+    pending=yes
+  fi
+  upgrade_validate_recovery_current "$backup" "$pending" || {
+    err "Recovery could not be verified; all files were preserved. Read $backup/RECOVERY.txt."; return 1;
+  }
+  read -r stage < "$backup/stage" && read -r kind < "$backup/kind" || return
+  if [[ "$stage" == rolled-back ]]; then
+    rm -f "$MIGRATION_BACKUP_DIR/upgrade-pending" || return
+    log "Previous rollback was verified; pending marker cleared. Backup: $backup"
+    return 0
+  fi
+  if [[ "$pending" == no ]]; then
+    [[ "$stage" == complete ]] || { err "Only the current completed backup can be restored."; return 1; }
+    upgrade_publish_pending "$backup" || return
+  fi
+  if [[ "$kind" == metadata ]]; then
+    upgrade_metadata_rollback "$backup"
+  else
+    upgrade_rollback "$backup"
+  fi
+)
+
+list_upgrade_backups() (
+  local root="$MIGRATION_BACKUP_DIR" backup name stage from to captured file
+  printf '%-22s %-20s %-12s %-12s %-20s %s\n' BACKUP STAGE FROM TO RECORDED RECOVERY
+  [[ -e "$root" || -L "$root" ]] || { echo "No upgrade backups."; return 0; }
+  upgrade_private_backup_directory "$root" || { err "Unsafe backup directory: $root"; return 1; }
+  shopt -s nullglob
+  for backup in "$root"/upgrade.* "$root"/migration.*; do
+    name=${backup##*/}
+    [[ "$name" =~ ^(upgrade|migration)\.[a-zA-Z0-9]+$ ]] || continue
+    if ! upgrade_private_backup_directory "$backup"; then printf '%s unsafe manual\n' "$name"; continue; fi
+    stage=unknown; from=unmarked; to=unknown; captured=unknown
+    if private_config_file "$backup/stage" >/dev/null 2>&1; then
+      read -r file < "$backup/stage" || true
+      [[ "$file" =~ ^[a-z-]+$ ]] && stage="$file"
+    fi
+    if private_config_file "$backup/created-at" >/dev/null 2>&1; then
+      read -r file < "$backup/created-at" || true
+      [[ "$file" =~ ^[0-9TZ:-]+$ ]] && captured="$file"
+    fi
+    for file in release new-release; do
+      if private_config_file "$backup/$file" >/dev/null 2>&1; then
+        read -r name _ < "$backup/$file" || true
+        if release_tag_valid "$name"; then
+          if [[ "$file" == release ]]; then from="$name"; else to="$name"; fi
+        fi
+      fi
+    done
+    name=${backup##*/}
+    if [[ "$name" == upgrade.* ]] && upgrade_validate_backup "$backup" >/dev/null 2>&1; then file=guarded
+    else file=manual; fi
+    printf '%-22s %-20s %-12s %-12s %-20s %s\n' "$name" "$stage" "$from" "$to" "$captured" "$file"
+  done
+)
+
+recover_upgrade_interactive() {
+  local requested="${1:-}" backup pending=no current confirmation stage kind
+  if [[ -z "$requested" ]]; then
+    list_upgrade_backups || return
+    if [[ -e "$MIGRATION_BACKUP_DIR/upgrade-pending" || -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]]; then
+      requested=$(upgrade_pending_backup) || return
+    else
+      read -r -p "Backup ID to restore: " requested || return 1
+    fi
+  fi
+  backup=$(upgrade_backup_path "$requested") || return
+  if [[ -e "$MIGRATION_BACKUP_DIR/upgrade-pending" || -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]]; then
+    current=$(upgrade_pending_backup) || return
+    [[ "$current" == "$backup" ]] || { err "A different upgrade is pending."; return 1; }
+    pending=yes
+  fi
+  ( shopt -s nullglob; upgrade_validate_recovery_current "$backup" "$pending" ) || {
+    err "This backup cannot be restored automatically. Read $backup/RECOVERY.txt."; return 1;
+  }
+  read -r stage < "$backup/stage" && read -r kind < "$backup/kind" || return
+  printf 'Restore backup: %s\nStage: %s\nOperation: %s\nProfiles and prior service intent:\n' "$backup" "$stage" "$kind"
+  cat "$backup/intent" || return
+  if [[ "$kind" == runtime ]]; then warn "Active connections may pause while the verified previous runtime is restored."; fi
+  printf 'Type %s to restore this backup: ' "${backup##*/}"
+  IFS= read -r confirmation || { err "Recovery canceled."; return 1; }
+  [[ "$confirmation" == "${backup##*/}" ]] || { err "Recovery canceled."; return 1; }
+  recover_upgrade_backup "$backup"
+}
+
 upgrade_apply() {
   local backup="$1" id active enabled
   upgrade_verify_profiles_unchanged "$backup" &&
@@ -1745,7 +2406,7 @@ upgrade_rollback() {
 
 automatic_upgrade() (
   GRE4_RELEASE_TAG="$1"; GRE4_RELEASE_SHA="$2"
-  local file id active enabled digest unit_digest installed_tag helper_hash unit_hash manager_hash extra backup staged unit units
+  local file id active enabled digest unit_digest installed_tag helper_hash unit_hash manager_hash extra backup unit units
   local backup_root="$MIGRATION_BACKUP_DIR" count=0 UPGRADE_RUNTIME_LOCKED=0 state_entries
   manager_hash=
   release_tag_valid "$GRE4_RELEASE_TAG" && [[ "$GRE4_RELEASE_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -1807,27 +2468,7 @@ automatic_upgrade() (
       err "Installed release is newer than the selected release; automatic downgrade refused."; return 1;
     }
   else
-    case "$digest" in
-      "$UPGRADE_V111_HELPER_SHA256"|"$UPGRADE_V111_BASH51_HELPER_SHA256") ;;
-      *) err "Installed helper is unknown; automatic upgrade refused."; return 1 ;;
-    esac
-    # The unmarked release has exactly this template; no edited commands are adopted.
-    cmp -s "$TEMPLATE_FILE" <(cat <<EOF_UNIT
-[Unit]
-Description=GRE4 connection %i
-Wants=network-online.target
-After=network-online.target ssh.service ssh.socket
-
-[Service]
-Type=oneshot
-ExecStart=$APPLY_SCRIPT start %i
-ExecStopPost=$APPLY_SCRIPT post-stop %i
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_UNIT
-    ) || { err "Unrecognized GRE4 service template; automatic upgrade refused."; return 1; }
+    upgrade_verify_unmarked_pair "$APPLY_SCRIPT" "$TEMPLATE_FILE" || return
     installed_tag=v1.1.1
   fi
   if [[ -e "$STATE_DIR" ]]; then
@@ -1862,12 +2503,6 @@ EOF_UNIT
     log "Already installed: $GRE4_RELEASE_TAG. Opening the menu without restarting connections."
     return 0
   fi
-  # Every role-specific prerequisite is checked before any existing service is stopped.
-  for file in "$PROFILE_DIR"/*.conf; do
-    id=${file##*/}; id=${id%.conf}
-    load_profile "$id" && profile_preflight && check_local_public_ip "$LOCAL_PUBLIC_IP" &&
-      render_profile "$id" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$ALLOW_UDP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" >/dev/null || return 1
-  done
   private_directory "$backup_root" || return
   backup=$(mktemp -d "$backup_root/upgrade.XXXXXX") || return
   chmod 700 "$backup" || return
@@ -1887,6 +2522,12 @@ EOF_UNIT
   chmod 600 "$backup/intent" || return
   cat > "$backup/RECOVERY.txt" <<EOF_RECOVERY
 GRE4 upgrade recovery evidence. Do not copy runtime-evidence over live state.
+Use the verified release's --backups and --recover commands for guarded recovery.
+Read $backup/kind before any manual operation. If it says metadata, the runtime
+was unchanged: restore only the original release record (or remove the verified
+new record if the original was absent). Do not stop, mask, reload or restart
+connections for metadata recovery. The runtime instructions below apply only
+when kind is runtime. Preserve the pending marker until recovery is verified.
 Original profiles: $backup/profiles
 Original helper: $backup/gre4-apply.sh
 Original template: $backup/gre4@.service
@@ -1911,10 +2552,24 @@ EOF_RECOVERY
   upgrade_prepare_artifacts "$backup" || {
     err "Cannot prepare upgrade artifacts; existing connections were not changed. Backup: $backup"; return 1;
   }
+  upgrade_prepare_recovery "$backup" || return
+  if ! upgrade_same_runtime "$backup"; then
+    # Loading conntrack is only appropriate when the runtime actually changes.
+    for file in "$PROFILE_DIR"/*.conf; do
+      id=${file##*/}; id=${id%.conf}
+      load_profile "$id" && profile_preflight && check_local_public_ip "$LOCAL_PUBLIC_IP" &&
+        render_profile "$id" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$ALLOW_UDP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" >/dev/null || return 1
+    done
+  fi
   migration_set_stage "$backup" prepared || return
-  staged=$(mktemp "$backup_root/.upgrade-pending.XXXXXX") || return
-  if ! printf '%s\n' "$backup" > "$staged" || ! chmod 600 "$staged" || ! mv -f "$staged" "$backup_root/upgrade-pending"; then
-    rm -f "$staged"; return 1
+  upgrade_validate_backup "$backup" || { err "Cannot verify prepared recovery data. Backup: $backup"; return 1; }
+  upgrade_publish_pending "$backup" || return
+  if upgrade_same_runtime "$backup"; then
+    if upgrade_metadata_apply "$backup"; then return 0; fi
+    if ! upgrade_metadata_rollback "$backup"; then
+      err "Release-record recovery needs review; connections were not restarted. Backup: $backup"
+    fi
+    return 1
   fi
   if upgrade_apply "$backup"; then return 0; fi
   if ! upgrade_rollback "$backup"; then
@@ -1924,29 +2579,53 @@ EOF_RECOVERY
 )
 
 main_menu() {
-  echo "1) Add connection on Iran (gateway)"
-  echo "2) Add Iran peer on Kharej (outside server)"
-  echo "3) Manage a connection"
-  echo "4) List connections"
-  echo "5) Connection status"
-  echo "6) Migrate a v1.0.1 installation"
+  echo '1) Add connection on Iran (gateway)'
+  echo '2) Add Iran peer on Kharej (outside server)'
+  echo '3) Manage a connection'
+  echo '4) List connections'
+  echo '5) Connection status'
+  echo '6) Migrate a v1.0.1 installation'
+  echo '7) Read-only diagnostics'
+  echo '8) Backups and recovery'
 }
 
 main() {
-  need_root
-  if [[ ${1:-} != --gre4-release ]]; then
-    release_bootstrap "$@" || return
-    return 0
+  local verified=no choice id
+  if [[ ${1:-} == --gre4-release ]]; then
+    [[ $# -ge 3 ]] || { err 'Invalid release handoff.'; return 1; }
+    release_verified_handoff "$2" "$3" "${BASH_SOURCE[0]}" || return
+    shift 3
+    verified=yes
   fi
-  [[ $# == 3 ]] || { err "Invalid release invocation. Run the documented installation command."; return 1; }
-  release_verified_handoff "$2" "$3" "${BASH_SOURCE[0]}" || return
-  ensure_cmd ip || return
-  ensure_cmd sysctl || return
-  ensure_cmd flock || return
+  case ${1:-} in
+    --help|-h)
+      [[ $# == 1 ]] || { err 'Help takes no additional arguments.'; return 1; }
+      operator_help; return ;;
+    --status|--doctor|--backups)
+      [[ $# == 1 ]] || { err 'Read-only commands take no additional arguments.'; return 1; }
+      need_root
+      case "$1" in
+        --status) operator_status ;;
+        --doctor) operator_doctor ;;
+        --backups) list_upgrade_backups ;;
+      esac
+      return ;;
+    --recover)
+      [[ $# -le 2 ]] || { err 'Use --recover with at most one backup ID.'; return 1; }
+      need_root
+      if [[ "$verified" != yes ]]; then release_bootstrap "$@" || return; return 0; fi
+      ensure_cmd ip && ensure_cmd sysctl && ensure_cmd flock && ensure_cmd systemctl || return
+      recover_upgrade_interactive "${2:-}"
+      return ;;
+    '') [[ $# == 0 ]] || { err 'Empty command argument is invalid.'; return 1; } ;;
+    *) err "Unknown command: $1"; operator_help; return 1 ;;
+  esac
+  need_root
+  if [[ "$verified" != yes ]]; then release_bootstrap "$@" || return; return 0; fi
+  ensure_cmd ip && ensure_cmd sysctl && ensure_cmd flock || return
   automatic_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA" || return
   main_menu
-  local choice id
-  read -r -p "Choice (1-6): " choice || return
+  read -r -p 'Choice (1-8): ' choice || return
   case "$choice" in
     1) add_profile_interactive iran ;;
     2) add_profile_interactive kharej ;;
@@ -1954,7 +2633,9 @@ main() {
     4) list_profiles ;;
     5) list_profiles; id=$(prompt_default 'Connection ID' ''); profile_status "$id" ;;
     6) migrate_legacy_deployment ;;
-    *) err "Invalid option."; return 1 ;;
+    7) operator_doctor ;;
+    8) recover_upgrade_interactive ;;
+    *) err 'Invalid option.'; return 1 ;;
   esac
 }
 

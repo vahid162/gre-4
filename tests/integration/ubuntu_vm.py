@@ -24,7 +24,9 @@ RELEASES = {'22.04': 'jammy', '24.04': 'noble', '26.04': 'resolute', '26.10': 's
 REPO = Path(__file__).resolve().parents[2]
 GUEST_FILES = [REPO / 'gre4.sh', Path(__file__).with_name('guest_acceptance.py'),
                Path(__file__).with_name('echo_server.py'), REPO / 'tests/fixtures/v1.0.1-apply.sh',
-               REPO / 'tests/fixtures/v1.1.1-manager.sh', REPO / 'VERSION']
+               REPO / 'tests/fixtures/v1.1.1-manager.sh',
+               REPO / 'tests/fixtures/v1.1.1-bash51-apply.sh',
+               REPO / 'tests/fixtures/v1.1.1-bash52-apply.sh', REPO / 'VERSION']
 
 
 def command(*args, **kwargs):
@@ -257,22 +259,7 @@ def acceptance(guests, record):
         for guest in guests:
             guest.check('clean')
         record.setdefault('passed', []).append(firewall + ': TCP/UDP, independent profiles, failure/retry, cleanup')
-    record['phase'] = 'profile-auto-upgrade'
-    for guest in guests:
-        guest.check('setup', '--firewall', 'active-dual', '--baseline')
-    outside.check('traffic')
-    outside.check('upgrade-interrupt')
-    outside.reboot()
-    outside.check('upgrade-recover')
-    outside.check('upgrade')
-    outside.check('traffic', '--peer', 'iran1')
-    outside.ssh('sudo', 'systemctl', 'enable', '--now', 'gre4@iran2.service')
-    outside.check('traffic')
-    first.check('upgrade')
-    outside.check('traffic')
-    for guest in guests:
-        guest.check('clean')
-    record['passed'].append('canonical profile auto-upgrade: interrupted cutover/reboot, old-peer traffic, rollback, intent, unknown refusal, no-op')
+    profile_upgrade_acceptance(guests, record)
     record['phase'] = 'canonical-migration'
     for guest in [outside, first]:
         guest.check('legacy-setup')
@@ -284,6 +271,43 @@ def acceptance(guests, record):
     for guest in [outside, first]:
         guest.check('remove', '--profile', 'legacy')
     record['passed'].append('canonical v1.0.1 active-pair migration with real traffic')
+
+
+def profile_upgrade_acceptance(guests, record):
+    outside, first, second = guests
+    record['phase'] = 'profile-auto-upgrade'
+    for guest in guests:
+        guest.check('setup', '--firewall', 'active-dual', '--baseline')
+    # Capture both old peers before touching the outside server. Their official
+    # helper/unit/profile bytes and absent release records must stay unchanged.
+    old_peers = {}
+    for guest in [first, second]:
+        old_peers[guest.role] = guest.ssh('sudo', 'sha256sum', '/usr/local/sbin/gre4-apply.sh',
+                                        '/etc/systemd/system/gre4@.service',
+                                        '/etc/gre4/profiles/' + guest.role + '.conf').stdout
+        guest.ssh('test', '!', '-e', '/var/lib/gre4-release')
+    outside.check('traffic')
+    outside.check('upgrade-metadata')
+    outside.check('upgrade-interrupt')
+    outside.reboot()
+    outside.check('upgrade-recover')
+    outside.check('upgrade')
+    outside.check('traffic', '--peer', 'iran1')
+    outside.ssh('sudo', 'systemctl', 'enable', '--now', 'gre4@iran2.service')
+    outside.check('traffic')
+    for guest in [first, second]:
+        assert guest.ssh('sudo', 'sha256sum', '/usr/local/sbin/gre4-apply.sh',
+                         '/etc/systemd/system/gre4@.service',
+                         '/etc/gre4/profiles/' + guest.role + '.conf').stdout == old_peers[guest.role]
+        guest.ssh('test', '!', '-e', '/var/lib/gre4-release')
+        guest.check('check')
+    first.check('upgrade')
+    outside.check('traffic')
+    for guest in guests:
+        guest.check('clean')
+    record['passed'].append('canonical profile upgrade: readonly CLI, v1.2 metadata/no-restart and recovery, '
+                            'cross-Bash runtime cutover/reboot/public recovery, old-peer traffic, '
+                            'GRE-fault rollback, intent, unknown refusal, no-op')
 
 
 def main():

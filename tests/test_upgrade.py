@@ -44,6 +44,7 @@ systemctl() {
     show)
       [[ ${@: -1} != gre4@.service ]] || { echo 'missing the instance name' >&2; return 1; }
       case $2 in
+        --property=UnitPath) printf '%s\n' "$ROOT" ;;
         --property=FragmentPath) printf '%s\n' "$TEMPLATE_FILE" ;;
         --property=DropInPaths) [[ ! -f $ROOT/dropin ]] || echo /custom.conf ;;
         --property=NeedDaemonReload) echo no ;;
@@ -70,8 +71,10 @@ systemctl() {
       [[ -f $ROOT/enabled/$id ]] && { echo enabled; return 0; }; echo disabled; return 1 ;;
     is-active) [[ -f $ROOT/active/$id ]] ;;
     stop) rm -f "$ROOT/active/$id" ;;
-    mask) touch "$ROOT/masked/$id" ;;
-    unmask) rm -f "$ROOT/masked/$id" ;;
+    mask)
+      touch "$ROOT/masked/$id"
+      [[ -L $ROOT/gre4@$id.service ]] || ln -s /dev/null "$ROOT/gre4@$id.service" ;;
+    unmask) rm -f "$ROOT/masked/$id" "$ROOT/gre4@$id.service" ;;
     daemon-reload|enable|disable) : ;;
     start)
       [[ ! -f $ROOT/masked/$id ]] || return 1
@@ -93,6 +96,9 @@ for id in alpha beta gamma; do
   write_profile "$id" iran 192.0.2.1 "$peer" 443,2096 yes "$subnet"
 done
 touch "$ROOT/active/alpha" "$ROOT/enabled/alpha" "$ROOT/enabled/gamma"
+mkdir -p "$ROOT/multi-user.target.wants"
+ln -s "$TEMPLATE_FILE" "$ROOT/multi-user.target.wants/gre4@alpha.service"
+ln -s "$TEMPLATE_FILE" "$ROOT/multi-user.target.wants/gre4@gamma.service"
 mkdir -p "$STATE_DIR/profiles/alpha"
 cp "$PROFILE_DIR/alpha.conf" "$STATE_DIR/profiles/alpha/applied.conf"
 chmod 600 "$STATE_DIR/profiles/alpha/applied.conf"
@@ -167,11 +173,58 @@ invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
 ! grep -Eq 'systemctl (stop|start|mask|unmask|daemon-reload)|install-helper|helper stop' "$ROOT/log"
 ''')
 
+    def test_new_release_with_identical_runtime_updates_only_its_record(self):
+        self.run_upgrade(r'''
+install_apply_script() { cp "$ROOT/original-helper" "$APPLY_SCRIPT"; }
+profile_preflight() { return 99; }
+invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+[[ -f $ROOT/active/alpha && ! -f $ROOT/active/beta && ! -f $ROOT/active/gamma ]]
+[[ -f $ROOT/enabled/alpha && ! -f $ROOT/enabled/beta && -f $ROOT/enabled/gamma ]]
+[[ -f $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR/upgrade-pending ]]
+grep -q 'v1.2.0' "$RELEASE_STAMP_FILE"
+if grep -Eq 'systemctl (stop|start|mask|unmask|daemon-reload)|helper stop' "$ROOT/log"; then exit 71; fi
+backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'upgrade.*')
+[[ -f $backup/recovery.sha256 && -f $backup/recovery-format && $(cat "$backup/stage") == complete ]]
+''')
+
+    def test_identical_runtime_record_failure_keeps_running_without_restart(self):
+        self.run_upgrade(r'''
+install_apply_script() { cp "$ROOT/original-helper" "$APPLY_SCRIPT"; }
+eval "$(declare -f migration_restore_file | sed '1s/migration_restore_file/fixture_restore_file/')"
+migration_restore_file() {
+  [[ $1 != */new-release ]] || return 1
+  fixture_restore_file "$@"
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+[[ -f $ROOT/active/alpha && ! -e $RELEASE_STAMP_FILE ]]
+if grep -Eq 'systemctl (stop|start|mask|unmask|daemon-reload)|helper stop' "$ROOT/log"; then exit 71; fi
+[[ ! -e $MIGRATION_BACKUP_DIR/upgrade-pending ]]
+''')
+
+    def test_identical_runtime_record_failure_restores_existing_private_record(self):
+        self.run_upgrade(r'''
+GRE4_RELEASE_TAG=v1.1.1
+record_installed_release
+cp "$RELEASE_STAMP_FILE" "$ROOT/original-release"
+GRE4_RELEASE_TAG=v1.2.0
+install_apply_script() { cp "$ROOT/original-helper" "$APPLY_SCRIPT"; }
+profile_preflight() { return 99; }
+eval "$(declare -f migration_restore_file | sed '1s/migration_restore_file/fixture_restore_file/')"
+migration_restore_file() {
+  fixture_restore_file "$@" || return
+  [[ $1 != */new-release ]] || return 1
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+cmp "$RELEASE_STAMP_FILE" "$ROOT/original-release"
+[[ -f $ROOT/active/alpha && ! -e $MIGRATION_BACKUP_DIR/upgrade-pending ]]
+if grep -Eq 'systemctl (stop|start|mask|unmask|daemon-reload)|helper stop' "$ROOT/log"; then exit 71; fi
+''')
+
     def test_unknown_or_modified_helper_and_unit_are_not_stopped(self):
         self.run_upgrade(r'''
 echo '# edited' >> "$APPLY_SCRIPT"
 if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
-! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
+if grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"; then exit 72; fi
 cp "$ROOT/original-helper" "$APPLY_SCRIPT"
 echo '# edited unit' >> "$TEMPLATE_FILE"
 if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 71; fi
@@ -194,7 +247,8 @@ touch "$ROOT/fail-preflight"
 if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
 [[ -f $ROOT/active/alpha && ! -f $RELEASE_STAMP_FILE ]]
 cmp "$ROOT/original-helper" "$APPLY_SCRIPT"
-! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
+cmp "$ROOT/original-unit" "$TEMPLATE_FILE"
+! grep -Eq 'systemctl (stop|start|mask)' "$ROOT/log"
 ''')
 
     def test_failure_restores_old_pair_then_only_previously_active_service(self):
@@ -294,6 +348,8 @@ invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
 cp "$RELEASE_STAMP_FILE" "$ROOT/first-release"
 [[ $(stat -c %a "$RELEASE_STAMP_FILE") == 600 ]]
 GRE4_RELEASE_TAG=v1.3.0
+eval "$(declare -f install_apply_script | sed '1s/install_apply_script/fixture_install_helper/')"
+install_apply_script() { fixture_install_helper || return; echo '# future generation' >> "$APPLY_SCRIPT"; }
 eval "$(declare -f systemctl | sed '1s/systemctl/old_systemctl/')"
 systemctl() {
   if [[ $1 == start && -e $ROOT/fail-once ]]; then rm "$ROOT/fail-once"; return 1; fi

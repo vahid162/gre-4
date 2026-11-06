@@ -9,6 +9,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 
 
@@ -16,6 +17,15 @@ ROOT = Path('/opt/gre4-acceptance')
 MARKER = Path('/var/lib/gre4-acceptance-vm')
 SOURCE = ROOT / 'gre4.sh'
 BASELINE = ROOT / 'v1.1.1-manager.sh'
+HELPER = Path('/usr/local/sbin/gre4-apply.sh')
+TEMPLATE = Path('/etc/systemd/system/gre4@.service')
+RECORD = Path('/var/lib/gre4-release')
+BACKUPS = Path('/var/backups/gre4')
+CANONICAL_HELPERS = {
+    'v1.1.1-bash51-apply.sh': 'd4b886236ae42f2b0a2e8f7a7ffd83f47137af3ef95ee2c49933098d2e7a28a8',
+    'v1.1.1-bash52-apply.sh': '1bde86457fce770ff00c9e2c339fae9dae152ac5bd72f1385a31f76fa99eb86d',
+}
+V120_MANAGER_SHA256 = '6672dc47a9fe49c5e4e44fdefe435cfc40730b4e17d1e45b26014c8649dd2f23'
 PORT = '2096'
 ENDPOINTS = {'kharej': '192.0.2.1', 'iran1': '192.0.2.2', 'iran2': '198.51.100.2'}
 
@@ -32,12 +42,12 @@ def manager(body, check=True):
     return run('bash', '-se', input=source.rsplit('\nmain "$@"', 1)[0] + '\n' + body, check=check)
 
 
-def release_command():
+def release_command(*args):
     # PR acceptance runs this exact candidate without downloading a prior public release.
     # The network/checksum bootstrap is covered separately with hermetic HTTP substitutes.
     # Only disposable guests use xtrace; retain the failed guard in acceptance logs.
     return ['bash', '-x', str(SOURCE), '--gre4-release', 'v' + (ROOT / 'VERSION').read_text().strip(),
-            hashlib.sha256(SOURCE.read_bytes()).hexdigest()]
+            hashlib.sha256(SOURCE.read_bytes()).hexdigest(), *args]
 
 
 def menu(role, profile, local, peer, subnet, udp='yes', success=True):
@@ -261,7 +271,127 @@ def migrate():
     assert_admin_rules()
 
 
+def connection_identity(profile='iran1'):
+    service = run('systemctl', 'show', '--property=InvocationID', '--value',
+                  'gre4@' + profile + '.service').stdout.strip()
+    assert service, 'Active service has no InvocationID: ' + profile
+    link = json.loads(run('ip', '-j', 'link', 'show', 'dev', 'g4-' + profile).stdout)[0]['ifindex']
+    return service, link
+
+
+def filesystem_snapshot(paths):
+    """Detect rewrites as well as content changes, ignoring access timestamps."""
+    result = {}
+    for root in paths:
+        entries = [root, *sorted(root.rglob('*'))] if root.is_dir() else [root]
+        for path in entries:
+            if not path.exists() and not path.is_symlink():
+                result[str(path)] = None
+                continue
+            stat = path.lstat()
+            value = os.readlink(path) if path.is_symlink() else path.read_bytes() if path.is_file() else None
+            result[str(path)] = (stat.st_mode, stat.st_ino, stat.st_mtime_ns, value)
+    return result
+
+
+def runtime_snapshot(role):
+    result = {
+        'files': filesystem_snapshot([HELPER, TEMPLATE, Path('/etc/gre4'), Path('/var/lib/gre4'),
+                                      Path('/etc/ufw/before.rules'), Path('/etc/default/ufw'),
+                                      Path('/etc/sysctl.d/99-gre4-forward.conf'),
+                                      Path('/etc/sysctl.d/99-gre4-conntrack.conf')]),
+        'services': {}, 'interfaces': {},
+    }
+    for profile in profiles(role):
+        active = run('systemctl', 'show', '--property=ActiveState', '--value',
+                     'gre4@' + profile + '.service').stdout.strip()
+        enabled = run('systemctl', 'show', '--property=UnitFileState', '--value',
+                      'gre4@' + profile + '.service').stdout.strip()
+        result['services'][profile] = (active, enabled)
+        if active == 'active':
+            result['interfaces'][profile] = connection_identity(profile)
+    return result
+
+
+def readonly_cli(role):
+    before = runtime_snapshot(role)
+    files = filesystem_snapshot([RECORD, BACKUPS, Path('/run/lock/gre4')])
+    with tempfile.TemporaryDirectory(prefix='readonly-cli-', dir=ROOT) as temporary:
+        tools = Path(temporary)
+        attempted = tools / 'bootstrap-attempted'
+        curl = tools / 'curl'
+        curl.write_text('#!/bin/sh\ntouch ' + shlex.quote(str(attempted)) + '\nexit 91\n')
+        curl.chmod(0o755)
+        for flag in ['--help', '--status', '--doctor', '--backups']:
+            # Invoke the raw entry without a verified handoff: these flags must
+            # remain useful offline, even when a newer release is available.
+            run('env', 'PATH=' + str(tools) + ':' + os.environ['PATH'], 'bash', str(SOURCE), flag)
+            assert not attempted.exists(), 'Read-only command attempted a release download: ' + flag
+            assert runtime_snapshot(role) == before, 'Read-only command changed runtime: ' + flag
+            assert filesystem_snapshot([RECORD, BACKUPS, Path('/run/lock/gre4')]) == files
+
+
+def opposite_canonical_helper(candidate_digest):
+    helpers = {}
+    for name, expected in CANONICAL_HELPERS.items():
+        data = (ROOT / name).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == expected, 'Corrupt canonical runtime fixture: ' + name
+        helpers[expected] = data
+    assert candidate_digest in helpers, 'Candidate runtime is not an official canonical variant'
+    return next(data for digest, data in helpers.items() if digest != candidate_digest)
+
+
+def seed_opposite_canonical_runtime():
+    # Both byte variants were emitted by the unmodified official manager. Their
+    # difference is Bash serialization, so no edited helper or forged stamp is
+    # needed to exercise a real, recognized runtime replacement in every guest.
+    with tempfile.TemporaryDirectory(prefix='candidate-runtime-', dir=ROOT) as temporary:
+        candidate = Path(temporary) / 'helper.sh'
+        manager('APPLY_SCRIPT=' + shlex.quote(str(candidate)) + '\ninstall_apply_script\n')
+        opposite = opposite_canonical_helper(hashlib.sha256(candidate.read_bytes()).hexdigest())
+    HELPER.write_bytes(opposite)
+    HELPER.chmod(0o755)
+    RECORD.unlink(missing_ok=True)
+    return opposite
+
+
+def metadata_upgrade(role):
+    assert role == 'kharej'
+    unit('iran2', 'stop')  # Keep this inactive peer enabled to cover separate boot intent.
+    assert hashlib.sha256(HELPER.read_bytes()).hexdigest() in CANONICAL_HELPERS.values()
+    # The published v1.2.0 manager used this unchanged function and runtime pair.
+    # Seed its genuine record rather than inventing a tag/hash for modified code.
+    manager('GRE4_RELEASE_TAG=v1.2.0\nGRE4_RELEASE_SHA=' + V120_MANAGER_SHA256 + '\nrecord_installed_release\n')
+    previous = RECORD.read_bytes()
+    assert previous.startswith(b'v1.2.0 ')
+    readonly_cli(role)
+    before = runtime_snapshot(role)
+    backups = set(BACKUPS.glob('upgrade.*'))
+    run(*release_command(), input='4\n')
+    assert runtime_snapshot(role) == before, 'Management-only release restarted or rewrote runtime'
+    created = set(BACKUPS.glob('upgrade.*')) - backups
+    assert len(created) == 1
+    backup = created.pop()
+    assert (backup / 'kind').read_text() == 'metadata\n'
+    assert (backup / 'stage').read_text() == 'complete\n'
+    assert (backup / 'release').read_bytes() == previous
+    assert (backup / 'recovery.sha256').is_file()
+    installed = RECORD.read_bytes()
+    assert installed == (backup / 'new-release').read_bytes() and installed != previous
+    run(*release_command('--recover', backup.name), input=backup.name + '\n')
+    assert RECORD.read_bytes() == previous, 'Metadata recovery did not restore the original release record'
+    assert runtime_snapshot(role) == before, 'Metadata recovery restarted or rewrote runtime'
+    assert (backup / 'stage').read_text() == 'rolled-back\n'
+    assert not (BACKUPS / 'upgrade-pending').exists()
+    assert set(BACKUPS.glob('upgrade.*')) == backups | {backup}, 'Recovery ran automatic upgrade first'
+    run(*release_command(), input='4\n')
+    assert RECORD.read_bytes() == installed
+    assert runtime_snapshot(role) == before
+    traffic('iran1')
+
+
 def upgrade(role):
+    seed_opposite_canonical_runtime()
     configs = {path.name: path.read_bytes() for path in Path('/etc/gre4/profiles').glob('*.conf')}
     helper = Path('/usr/local/sbin/gre4-apply.sh')
     template = Path('/etc/systemd/system/gre4@.service')
@@ -269,12 +399,6 @@ def upgrade(role):
     if role == 'kharej':
         unit('iran2', 'stop')
         unit('iran2', 'disable')
-
-    def identity():
-        service = run('systemctl', 'show', '--property=InvocationID', '--value',
-                      'gre4@iran1.service').stdout.strip()
-        link = json.loads(run('ip', '-j', 'link', 'show', 'dev', 'g4-iran1').stdout)[0]['ifindex']
-        return service, link
 
     def preserved():
         assert configs == {path.name: path.read_bytes()
@@ -286,12 +410,12 @@ def upgrade(role):
             assert unit('iran2', 'is-enabled', check=False).returncode != 0
         assert_admin_rules()
 
-    before = identity()
+    before = connection_identity()
     helper.write_bytes(old_helper + b'\n# disposable local customization\n')
     try:
         result = run(*release_command(), input='4\n', check=False)
         assert result.returncode != 0, result.stdout + result.stderr
-        assert identity() == before
+        assert connection_identity() == before
         preserved()
     finally:
         helper.write_bytes(old_helper)
@@ -322,14 +446,17 @@ def upgrade(role):
             wrapper.unlink()
             fault.unlink(missing_ok=True)
 
+    before = connection_identity()
     run(*release_command(), input='4\n')
     preserved()
+    assert connection_identity() != before, 'Changed canonical runtime did not exercise a full cutover'
+    assert helper.read_bytes() != old_helper
     stamp = Path('/var/lib/gre4-release').read_bytes()
     assert stamp
-    before = identity()
+    before = connection_identity()
     backups = sorted(str(path) for path in Path('/var/backups/gre4').glob('upgrade.*'))
     run(*release_command(), input='4\n')
-    assert identity() == before, 'Same-release invocation restarted an active connection'
+    assert connection_identity() == before, 'Same-release invocation restarted an active connection'
     assert Path('/var/lib/gre4-release').read_bytes() == stamp
     assert sorted(str(path) for path in Path('/var/backups/gre4').glob('upgrade.*')) == backups
     preserved()
@@ -339,6 +466,7 @@ def upgrade(role):
 def interrupted_upgrade():
     unit('iran2', 'stop')
     unit('iran2', 'disable')
+    seed_opposite_canonical_runtime()
     tag = 'v' + (ROOT / 'VERSION').read_text().strip()
     digest = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
     result = manager(r'''
@@ -383,7 +511,10 @@ def recover_interrupted_upgrade():
     result = run(*release_command(), input='4\n', check=False)
     assert result.returncode != 0, result.stdout + result.stderr
     assert_interrupted_upgrade(backup)
-    manager('upgrade_rollback ' + shlex.quote(str(backup)) + '\n')
+    run(*release_command('--recover', backup.name), input=backup.name + '\n')
+    assert (backup / 'stage').read_text() == 'rolled-back\n'
+    assert HELPER.read_bytes() == (backup / 'gre4-apply.sh').read_bytes()
+    assert TEMPLATE.read_bytes() == (backup / 'gre4@.service').read_bytes()
     assert not Path('/var/backups/gre4/upgrade-pending').exists()
     check('kharej', ['iran1'])
     run('systemctl', 'is-enabled', '--quiet', 'gre4@iran1.service')
@@ -397,7 +528,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['versions', 'setup', 'check', 'traffic', 'collision',
                         'inactive-cleanup', 'remove', 'clean', 'legacy-setup', 'migrate', 'upgrade',
-                        'upgrade-interrupt', 'upgrade-recover'])
+                        'upgrade-metadata', 'upgrade-interrupt', 'upgrade-recover'])
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--role', choices=list(ENDPOINTS), default='kharej')
     parser.add_argument('--firewall', choices=['inactive', 'active-v4', 'active-dual'], default='inactive')
@@ -435,6 +566,8 @@ def main():
         migrate()
     elif args.action == 'upgrade':
         upgrade(args.role)
+    elif args.action == 'upgrade-metadata':
+        metadata_upgrade(args.role)
     elif args.action == 'upgrade-interrupt':
         assert args.role == 'kharej'
         interrupted_upgrade()

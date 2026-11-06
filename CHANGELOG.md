@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-11-06
+
+### Added
+
+- Add independent read-only status, diagnostics and backup views that do not
+  download an update, install files, restart services or repair host settings.
+- Add explicit guarded recovery of supported upgrade backups, with a concrete
+  backup summary and confirmation before changing an installation. Validate
+  private recovery evidence, target paths, profiles and installed artifacts;
+  retain ambiguous or incomplete state for manual review.
+- Retry invalid connection inputs at the relevant prompt and show the complete
+  settings before applying a new connection. EOF aborts without saving a profile.
+
+### Changed
+
+- When a newer release produces identical helper and unit bytes, retain service
+  identity and update release metadata with a backup, without a runtime cutover.
+  Metadata-only failures and recovery do not restart connections.
+- Prepare changed-runtime prerequisites before stopping services; keep the
+  default fixed-command verified-release installation and same-release no-op.
+
+### Fixed
+
+- Retry transient release reads with bounded backoff and poll for visibility
+  after successful publication steps. Address delayed draft, asset and published
+  state visibility without blindly replaying mutations or overwriting assets.
+- Keep authentication errors, wrong release targets and corrupt assets fatal.
+
+### Administration and upgrade notes
+
+- Document GitHub's administrator-controlled immutable release setting and its
+  verification. A code change alone does not enable this repository setting;
+  published tags and assets are never rewritten by the publisher.
+- Recovery of older backups without sufficient verification evidence remains
+  manual. Runtime snapshots are never copied over live host state. Existing
+  canonical-singleton rollback limitations remain unchanged.
+- A normal invocation still selects the latest stable release, including after
+  an explicit rollback; use read-only commands when inspecting a restored host.
+
+### فارسی
+
+- وضعیت، عیب‌یابی و فهرست بکاپ‌ها مسیر فقط‌خواندنی دارند و ارتقا یا restart
+  انجام نمی‌دهند. ورودی نامعتبر در همان سؤال اصلاح می‌شود و خلاصهٔ تنظیمات
+  پیش از اعمال نمایش داده می‌شود.
+- اگر فایل اجرایی تونل و قالب سرویس تغییر نکرده باشند، ارتقا فقط رکورد انتشار
+  را با بکاپ به‌روزرسانی می‌کند و اتصال‌ها قطع نمی‌شوند.
+- بازیابی بکاپ‌های قابل تأیید با نمایش وضعیت و تأیید صریح ارائه می‌شود؛ دادهٔ
+  مبهم و بکاپ قدیمیِ فاقد شواهد کافی برای بررسی دستی حفظ می‌شود.
+- انتشار برای خطاهای گذرای خواندن و تأخیر دیده‌شدن پیش‌نویس و فایل‌ها تلاش
+  مجدد محدود دارد؛ خطای دسترسی، تگ نادرست یا فایل خراب همچنان متوقف می‌شود.
+- قفل ریلیزهای بعدی در GitHub یک تنظیم مدیریتی جداگانه است و روش فعال‌سازی
+  و بررسی آن در راهنمای انتشار آمده است. سرور عملیاتی از طریق CI تغییر نمی‌کند.
+
 ## 1.2.0 - 2026-11-05
 
 ### Added
