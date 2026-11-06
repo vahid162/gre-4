@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,6 +26,123 @@ guest = load('guest_acceptance')
 
 
 class UbuntuAcceptanceSafetyTests(unittest.TestCase):
+    def test_collision_retries_add_before_starting_a_preflight_rejected_profile(self):
+        self.check_collision()
+
+    def test_collision_rejects_changed_link_identity_or_kind(self):
+        for inspection in (2, 4):
+            for changed in ({'ifindex': 78, 'linkinfo': {'info_kind': 'dummy'}},
+                            {'ifindex': 77, 'linkinfo': {'info_kind': 'gre'}}):
+                with self.subTest(inspection=inspection, changed=changed):
+                    with self.assertRaises(AssertionError) as result:
+                        self.check_collision((inspection, changed))
+                    snapshots = json.loads(str(result.exception))
+                    self.assertEqual(snapshots['before'], [
+                        {'ifindex': 77, 'linkinfo': {'info_kind': 'dummy'}}])
+                    self.assertEqual(snapshots['after'], [changed])
+
+    def check_collision(self, changed_snapshot=None):
+        state = {'interface': None, 'profile': False, 'applied': False, 'inspections': 0, 'settled': False}
+
+        def command(*args, **kwargs):
+            if args[:3] == ('ip', 'link', 'add'):
+                self.assertIsNone(state['interface'])
+                state['interface'] = {'linkinfo': {'info_kind': 'dummy'}, 'ifindex': 77}
+                state['settled'] = False
+            elif args[:2] == ('udevadm', 'settle'):
+                state['settled'] = True
+            elif args[:3] == ('ip', 'link', 'delete'):
+                state['interface'] = None
+            elif args[0] == 'ip':
+                self.assertIsNotNone(state['interface'])
+                self.assertTrue(state['settled'], 'Settle each dummy before its baseline inspection')
+                state['inspections'] += 1
+                if changed_snapshot and state['inspections'] == changed_snapshot[0]:
+                    state['interface'] = changed_snapshot[1]
+            return subprocess.CompletedProcess(args, 0, json.dumps(
+                [state['interface']], sort_keys=state['inspections'] % 2 == 0,
+                indent=2 if state['inspections'] % 2 else None), '')
+
+        def add(*args, success=True, **kwargs):
+            self.assertEqual(success, state['interface'] is None)
+            if success:
+                state.update(profile=True, applied=True, interface={'kind': 'gre'})
+            return subprocess.CompletedProcess([], 0 if success else 1,
+                '' if success else 'An inactive connection still has an interface: collision', '')
+
+        def service(profile, action, check=True):
+            self.assertTrue(state['profile'], 'Start must not assume failed Add saved a profile')
+            if action == 'stop':
+                state.update(applied=False, interface=None)
+                return subprocess.CompletedProcess([], 0)
+            if state['interface'] is not None:
+                self.assertFalse(check)
+                return subprocess.CompletedProcess([], 1)
+            state.update(applied=True, interface={'kind': 'gre'})
+            return subprocess.CompletedProcess([], 0)
+
+        def path(value):
+            kind = 'profile' if value.startswith('/etc/') else 'applied'
+            return Mock(exists=lambda: state[kind])
+
+        with patch.object(guest, 'run', side_effect=command), \
+                patch.object(guest, 'menu', side_effect=add) as menu, \
+                patch.object(guest, 'unit', side_effect=service) as unit, \
+                patch.object(guest, 'Path', side_effect=path), \
+                patch.object(guest, 'manager') as manager, \
+                patch.object(guest, 'traffic') as traffic:
+            guest.collision()
+        self.assertEqual([call.kwargs.get('success', True) for call in menu.call_args_list], [False, True])
+        self.assertIn((('collision', 'start'), {'check': False}),
+                      [(call.args, call.kwargs) for call in unit.call_args_list])
+        self.assertEqual(unit.call_args.args, ('collision', 'start'))
+        manager.assert_called_once_with('profile_remove collision\n')
+        self.assertGreaterEqual(traffic.call_count, 3)
+
+    def test_partial_install_action_refuses_unmarked_machine_before_commands(self):
+        with patch.object(guest.os, 'geteuid', return_value=0), \
+                patch.object(guest, 'MARKER') as marker, \
+                patch.object(guest, 'run') as run, \
+                patch('sys.argv', ['guest_acceptance.py', 'repair-partial', '--role', 'iran1']), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            marker.is_file.return_value = False
+            with self.assertRaises(SystemExit) as result:
+                guest.main()
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn('Refusing to run outside', error.getvalue())
+            run.assert_not_called()
+
+    def test_partial_install_phase_detects_an_unexpected_old_peer_change(self):
+        for changed_peer in (None, 'kharej', 'iran2'):
+            with self.subTest(changed_peer=changed_peer):
+                guests = []
+                events = []
+                for role in ['kharej', 'iran1', 'iran2']:
+                    vm = Mock(role=role)
+                    vm.check.side_effect = lambda *args, role=role: events.append((role, args))
+                    reads = [0]
+
+                    def ssh(*args, role=role, reads=reads, **kwargs):
+                        if args[:2] == ('sudo', 'sha256sum'):
+                            reads[0] += 1
+                            changed = changed_peer == role and reads[0] > 1
+                            return subprocess.CompletedProcess(args, 0, role + ('-changed' if changed else '-old'), '')
+                        return subprocess.CompletedProcess(args, 0, '', '')
+
+                    vm.ssh.side_effect = ssh
+                    guests.append(vm)
+                record = {'passed': []}
+                if changed_peer is None:
+                    runner.partial_install_acceptance(guests, record)
+                    self.assertIn(('iran1', ('repair-partial',)), events)
+                    self.assertEqual([role for role, args in events if args == ('clean',)],
+                                     ['kharej', 'iran1', 'iran2'])
+                    self.assertTrue(any('partial install' in item for item in record['passed']))
+                else:
+                    with self.assertRaises(AssertionError):
+                        runner.partial_install_acceptance(guests, record)
+                    self.assertFalse(record['passed'])
+
     def test_release_command_forwards_operator_arguments_after_verified_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

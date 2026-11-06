@@ -56,6 +56,7 @@ def menu(role, profile, local, peer, subnet, udp='yes', success=True):
     result = run(*command, input='\n'.join(
         [choice, profile, local, peer, PORT, udp, subnet, '']), check=False)
     assert (result.returncode == 0) == success, result.stdout + result.stderr
+    return result
 
 
 def unit(profile, action, check=True):
@@ -188,12 +189,33 @@ def traffic(peer='both'):
 
 
 def collision():
+    profile = Path('/etc/gre4/profiles/collision.conf')
+    applied = Path('/var/lib/gre4/profiles/collision/applied.conf')
+    inspect = ('ip', '-j', '-d', 'link', 'show', 'dev', 'g4-collision')
     run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
-    menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30', success=False)
-    run('ip', 'link', 'show', 'dev', 'g4-collision')
-    assert not Path('/var/lib/gre4/profiles/collision/applied.conf').exists()
+    run('udevadm', 'settle', '--timeout=30')
+    foreign = json.loads(run(*inspect).stdout)
+    refused = menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30', success=False)
+    output = refused.stdout + refused.stderr
+    assert 'An inactive connection still has an interface: collision' in output, output
+    assert not profile.exists() and not applied.exists()
+    current = json.loads(run(*inspect).stdout)
+    assert current == foreign, json.dumps({'before': foreign, 'after': current})
     traffic()
     run('ip', 'link', 'delete', 'g4-collision')
+    menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30')
+    unit('collision', 'stop')
+    # Keep the runtime ownership check covered after Add's earlier refusal.
+    run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
+    run('udevadm', 'settle', '--timeout=30')
+    foreign = json.loads(run(*inspect).stdout)
+    assert unit('collision', 'start', check=False).returncode != 0
+    assert not applied.exists()
+    current = json.loads(run(*inspect).stdout)
+    assert current == foreign, json.dumps({'before': foreign, 'after': current})
+    traffic()
+    run('ip', 'link', 'delete', 'g4-collision')
+    run('systemctl', 'reset-failed', 'gre4@collision.service')
     unit('collision', 'start')
     manager('profile_remove collision\n')
     traffic()
@@ -353,6 +375,67 @@ def seed_opposite_canonical_runtime():
     HELPER.chmod(0o755)
     RECORD.unlink(missing_ok=True)
     return opposite
+
+
+def partial_install_repair(role):
+    assert role == 'iran1'
+    unit(role, 'stop')
+    unit(role, 'disable')
+    profile = Path('/etc/gre4/profiles/' + role + '.conf')
+    previous = profile.read_text()
+    assert previous.count('SERVICE_PORTS=2096\n') == 1
+    profile.write_text(previous.replace('SERVICE_PORTS=2096\n', 'SERVICE_PORTS=2096,8787,1194\n'))
+    config = profile.read_bytes()
+    original_helper, original_unit = HELPER.read_bytes(), TEMPLATE.read_bytes()
+    assert hashlib.sha256(original_helper).hexdigest() in CANONICAL_HELPERS.values()
+    HELPER.chmod(0o711)  # Match the reported root-owned, executable partial install.
+    TEMPLATE.unlink()
+    RECORD.unlink(missing_ok=True)
+    run('systemctl', 'daemon-reload')
+    assert not Path('/var/lib/gre4/profiles/' + role + '/applied.conf').exists()
+    assert not Path('/var/lib/gre4/profiles/' + role + '/cleanup-pending').exists()
+    assert run('ip', 'link', 'show', 'dev', 'g4-' + role, check=False).returncode != 0
+
+    # An incomplete installation does not authorize replacing customized code.
+    HELPER.write_bytes(original_helper + b'\n# disposable local customization\n')
+    try:
+        result = run(*release_command(), input='4\n', check=False)
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert not TEMPLATE.exists() and not RECORD.exists()
+        assert profile.read_bytes() == config
+    finally:
+        HELPER.write_bytes(original_helper)
+    preserved = filesystem_snapshot([HELPER, profile])
+    backups = set(BACKUPS.glob('install.*'))
+    run(*release_command(), input='4\n')
+    assert TEMPLATE.read_bytes() == original_unit
+    assert TEMPLATE.stat().st_uid == 0 and TEMPLATE.stat().st_mode & 0o777 == 0o644
+    assert filesystem_snapshot([HELPER, profile]) == preserved
+    created = set(BACKUPS.glob('install.*')) - backups
+    assert len(created) == 1, 'Known partial install did not retain exactly one repair backup'
+    backup = created.pop()
+    assert (backup / 'stage').read_text() == 'complete\n'
+    assert (backup / 'profiles' / profile.name).read_bytes() == config
+    assert (backup / 'helper').read_bytes() == original_helper
+    assert (backup / 'unit-absent').is_file()
+    assert (backup / 'new-unit').read_bytes() == original_unit
+    assert (backup / 'manifest.sha256').is_file()
+    assert backup.stat().st_uid == 0 and backup.stat().st_mode & 0o077 == 0
+    assert not (BACKUPS / 'install-pending').exists()
+    assert RECORD.read_text().startswith('v' + (ROOT / 'VERSION').read_text().strip() + ' ')
+    assert_admin_rules()
+
+    def inactive():
+        assert unit(role, 'is-active', check=False).returncode != 0
+        assert unit(role, 'is-enabled', check=False).stdout.strip() == 'disabled'
+        assert run('ip', 'link', 'show', 'dev', 'g4-' + role, check=False).returncode != 0
+        assert not Path('/var/lib/gre4/profiles/' + role + '/applied.conf').exists()
+
+    inactive()
+    repaired = filesystem_snapshot([HELPER, TEMPLATE, RECORD, profile, BACKUPS])
+    run(*release_command(), input='4\n')
+    assert filesystem_snapshot([HELPER, TEMPLATE, RECORD, profile, BACKUPS]) == repaired
+    inactive()
 
 
 def metadata_upgrade(role):
@@ -528,7 +611,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('action', choices=['versions', 'setup', 'check', 'traffic', 'collision',
                         'inactive-cleanup', 'remove', 'clean', 'legacy-setup', 'migrate', 'upgrade',
-                        'upgrade-metadata', 'upgrade-interrupt', 'upgrade-recover'])
+                        'upgrade-metadata', 'upgrade-interrupt', 'upgrade-recover', 'repair-partial'])
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--role', choices=list(ENDPOINTS), default='kharej')
     parser.add_argument('--firewall', choices=['inactive', 'active-v4', 'active-dual'], default='inactive')
@@ -574,6 +657,8 @@ def main():
     elif args.action == 'upgrade-recover':
         assert args.role == 'kharej'
         recover_interrupted_upgrade()
+    elif args.action == 'repair-partial':
+        partial_install_repair(args.role)
 
 
 if __name__ == '__main__':

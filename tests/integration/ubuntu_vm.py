@@ -260,6 +260,7 @@ def acceptance(guests, record):
             guest.check('clean')
         record.setdefault('passed', []).append(firewall + ': TCP/UDP, independent profiles, failure/retry, cleanup')
     profile_upgrade_acceptance(guests, record)
+    partial_install_acceptance(guests, record)
     record['phase'] = 'canonical-migration'
     for guest in [outside, first]:
         guest.check('legacy-setup')
@@ -271,6 +272,44 @@ def acceptance(guests, record):
     for guest in [outside, first]:
         guest.check('remove', '--profile', 'legacy')
     record['passed'].append('canonical v1.0.1 active-pair migration with real traffic')
+
+
+def partial_install_acceptance(guests, record):
+    outside, first, second = guests
+    record['phase'] = 'known-partial-install'
+    for vm in guests:
+        vm.check('setup', '--firewall', 'active-dual', '--baseline')
+
+    def old_peer_snapshot(vm):
+        ids = ['iran1', 'iran2'] if vm.role == 'kharej' else [vm.role]
+        files = ['/usr/local/sbin/gre4-apply.sh', '/etc/systemd/system/gre4@.service']
+        for profile in ids:
+            files.extend(['/etc/gre4/profiles/' + profile + '.conf',
+                          '/var/lib/gre4/profiles/' + profile + '/applied.conf'])
+        digest = vm.ssh('sudo', 'sha256sum', *files).stdout
+        identity = []
+        for profile in ids:
+            identity.append(vm.ssh('systemctl', 'show', '--property=ActiveState,UnitFileState,InvocationID',
+                                   'gre4@' + profile + '.service').stdout)
+            identity.append(vm.ssh('cat', '/sys/class/net/g4-' + profile + '/ifindex').stdout)
+        vm.ssh('test', '!', '-e', '/var/lib/gre4-release')
+        return digest, identity
+
+    old_peers = {vm.role: old_peer_snapshot(vm) for vm in [outside, second]}
+    outside.check('traffic')
+    first.check('repair-partial')
+    outside.check('traffic', '--peer', 'iran2')
+    first.ssh('sudo', 'systemctl', 'start', 'gre4@iran1.service')
+    first.check('check')
+    outside.check('traffic')
+    for vm in [outside, second]:
+        assert old_peer_snapshot(vm) == old_peers[vm.role], 'Partial install repair changed another guest'
+    for vm in guests:
+        vm.check('clean')
+    record['passed'].append('known partial install: missing unit repaired by default entry, '
+                            'ports/addresses/UDP and inactive/disabled intent preserved, '
+                            'unknown helper refused, repeated invocation unchanged, '
+                            'explicit start restores TCP/UDP and old peers stay unchanged')
 
 
 def profile_upgrade_acceptance(guests, record):

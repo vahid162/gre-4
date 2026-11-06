@@ -20,6 +20,7 @@ ANSWERS
 ''', expected)
 
     def sibling(self, role):
+        self.shell('install_profile_unit\n')
         if role == 'iran':
             self.shell('write_profile sibling iran 198.51.100.1 192.0.2.20 8443 no 172.16.1.4/30\n')
         else:
@@ -77,7 +78,8 @@ ANSWERS
     def test_failed_activation_cannot_be_hidden_by_enable_success(self):
         foreign = {'local': '', 'remote': '', 'alias': 'administrator',
                    'addresses': [], 'up': True}
-        self.update(interfaces={'g4-new': foreign})
+        # Inject the competing interface after file preflight, before activation.
+        self.update(interfaces_on_enable={'g4-new': foreign})
         # Some systemctl versions report a successful enable even when --now
         # logs a failed start. Keep the actual failed service state observable.
         result = self.add('kharej', expected=1, prefix='''systemctl() {
@@ -116,6 +118,60 @@ profile_start_service new
 ''', expected=1)
         self.assertIn('Connection did not become active', result.stdout + result.stderr)
         self.assertEqual(self.data()['interfaces'], {})
+
+    def test_preexisting_foreign_interface_is_rejected_before_profile_publication(self):
+        foreign = {'local': '', 'remote': '', 'alias': 'administrator',
+                   'addresses': [], 'up': True}
+        self.update(interfaces={'g4-new': foreign})
+        result = self.add('iran', expected=1)
+        self.assertIn('inactive connection still has an interface', result.stdout + result.stderr)
+        self.assertFalse((self.profiles / 'new.conf').exists())
+        self.assertEqual(self.data()['interfaces'], {'g4-new': foreign})
+        self.assertNotIn('systemctl enable gre4@new.service', self.data()['commands'])
+
+    def assert_interrupted_add_resumes(self, point):
+        prefix = ('GRE4_RELEASE_TAG=v1.3.1\nGRE4_RELEASE_SHA=' + 'a' * 64 + '\n' +
+                  'INTERRUPT_POINT=' + point + r'''
+                  eval "$(declare -f install_publish_file | sed '1s/install_publish_file/original_publish/')"
+                  install_publish_file() {
+                    original_publish "$@" || return
+                    if [[ $2 == "$INTERRUPT_POINT" ]]; then kill -KILL "$BASHPID"; fi
+                  }
+                  ''')
+        self.add('iran', expected=137, prefix=prefix)
+        before = (self.profiles / 'new.conf').read_bytes()
+        helper = self.helper.read_bytes()
+        self.assertTrue((self.root / 'backups/install-pending').is_file())
+        self.assertFalse((self.root / 'gre4@.service').exists())
+        self.assertEqual(self.data()['interfaces'], {})
+        self.shell(r'''
+need_root() { :; }
+release_verified_handoff() { GRE4_RELEASE_TAG=$1; GRE4_RELEASE_SHA=$2; }
+main --gre4-release v1.3.1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa <<<'4'
+''', timeout=30)
+        self.assertEqual((self.profiles / 'new.conf').read_bytes(), before)
+        self.assertEqual(self.helper.read_bytes(), helper)
+        self.assertFalse((self.root / 'backups/install-pending').exists())
+        self.assertTrue((self.root / 'gre4@.service').is_file())
+        self.assertFalse(self.data().get('active', {}).get('gre4@new.service', False))
+        self.assertFalse(self.data().get('enabled', {}).get('gre4@new.service', False))
+        self.assertFalse(any(command.startswith(('systemctl start ', 'systemctl enable '))
+                             for command in self.data()['commands']))
+        backups = list((self.root / 'backups').glob('install.*'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / 'stage').read_text(), 'complete\n')
+        self.shell(r'''
+need_root() { :; }
+release_verified_handoff() { GRE4_RELEASE_TAG=$1; GRE4_RELEASE_SHA=$2; }
+main --gre4-release v1.3.1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa <<<'4'
+''', timeout=30)
+        self.assertEqual(list((self.root / 'backups').glob('install.*')), backups)
+
+    def test_add_interrupted_after_profile_resumes_through_default_entry(self):
+        self.assert_interrupted_add_resumes('profile')
+
+    def test_add_interrupted_after_helper_resumes_through_default_entry(self):
+        self.assert_interrupted_add_resumes('helper')
 
 
 class CanonicalMigrationWorkflowTests(ProfileRuntimeCase):

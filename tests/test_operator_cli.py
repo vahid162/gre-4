@@ -223,6 +223,7 @@ LEGACY_CONF_FILE=$ROOT/legacy.conf
 UNIT_FILE=$ROOT/legacy.service
 APPLY_SCRIPT=$ROOT/helper
 TEMPLATE_FILE=$ROOT/unit
+RELEASE_STAMP_FILE=$ROOT/release
 mkdir -p "$PROFILE_DIR" "$STATE_DIR"
 chmod 700 "$PROFILE_DIR" "$STATE_DIR"
 cat > "$PROFILE_DIR/alpha.conf" <<'CONF'
@@ -239,14 +240,28 @@ chmod 600 "$PROFILE_DIR/alpha.conf"
 acquire_management_lock() { :; }
 profile_runtime_lock() { exec 8> "$ROOT/runtime-lock"; }
 profile_preflight() { echo PREFLIGHT; }
-install_apply_script() { echo INSTALL; }
+install_apply_script() { echo INSTALL >&2; printf '#!/bin/bash\nexit 0\n' > "$APPLY_SCRIPT"; chmod 700 "$APPLY_SCRIPT"; }
 install_profile_unit() { :; }
 record_installed_release() { :; }
-systemctl() { :; }
+systemctl() {
+  if [[ $1 == show ]]; then
+    case $2 in
+      --property=UnitPath) echo "$ROOT" ;;
+      --property=FragmentPath) [[ ! -f "$TEMPLATE_FILE" ]] || echo "$TEMPLATE_FILE" ;;
+      --property=LoadState) [[ -f "$TEMPLATE_FILE" ]] && echo loaded || echo not-found ;;
+      --property=ActiveState) echo inactive ;;
+      --property=UnitFileState) [[ ! -f "$TEMPLATE_FILE" ]] || echo disabled ;;
+      --property=DropInPaths) : ;;
+      --property=NeedDaemonReload) echo no ;;
+      *) return 97 ;;
+    esac
+  fi
+}
 ip() {
   case "$*" in
     '-o -4 addr show') echo '1: eth0 inet 198.51.100.1/24 scope global eth0' ;;
     '-4 route show table all') echo '198.51.100.0/24 dev eth0' ;;
+    '-o link show') : ;;
     *) return 97 ;;
   esac
 }
