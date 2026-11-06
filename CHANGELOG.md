@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 1.3.2 - 2026-11-06
+
+### Changed
+
+- Require installer and upgrade changes to demonstrate compatibility in CI
+  using actual artifacts from the preceding stable release, including settings,
+  service intent, failure rollback and repeated-entry preservation.
+- Document migration and provenance requirements for known modified deployments
+  and temporary server patches without relaxing unknown-artifact protections.
+
+### Validation and limits
+
+- Repository policy and release metadata only; installer, helper and unit code
+  are unchanged. These rules require evidence for future relevant changes;
+  this release does not add CI scenarios or deploy to production servers.
+
+### فارسی
+
+- قواعد ارتقا، آزمون با فایل‌های واقعی انتشار قبلی و بررسی حفظ تنظیمات، وضعیت
+  سرویس، برگشت پس از شکست و اجرای مجدد بدون restart را الزامی می‌کنند.
+- نصب‌های اصلاح‌شدهٔ شناخته‌شده باید مسیر انتقال مشخص داشته باشند و وصله‌های
+  موقت با هش و راه برگشت ثبت شوند. این انتشار فقط قوانین مخزن را تغییر می‌دهد.
+
 ## 1.3.1 - 2026-11-06
 
 ### Fixed
