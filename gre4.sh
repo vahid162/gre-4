@@ -935,6 +935,10 @@ install_profile_unit() {
 }
 
 profile_normal_mutation_allowed() {
+  if [[ -e "$MIGRATION_BACKUP_DIR/install-pending" || -L "$MIGRATION_BACKUP_DIR/install-pending" ]]; then
+    err "Installation-file recovery is pending; rerun the documented installation command."
+    return 1
+  fi
   if [[ -e "$MIGRATION_BACKUP_DIR/upgrade-pending" || -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]]; then
     err "Upgrade recovery is pending; preserve the backup and review RECOVERY.txt before making changes."
     return 1
@@ -1079,7 +1083,7 @@ operator_status() (
   if [[ -e "$LEGACY_CONF_FILE" || -L "$LEGACY_CONF_FILE" || -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
     echo 'Legacy singleton artifacts are present; inspect migration/recovery before changing profiles.'
   fi
-  for file in "$MIGRATION_BACKUP_DIR/upgrade-pending" "$MIGRATION_BACKUP_DIR/pending"; do
+  for file in "$MIGRATION_BACKUP_DIR/install-pending" "$MIGRATION_BACKUP_DIR/upgrade-pending" "$MIGRATION_BACKUP_DIR/pending"; do
     if [[ -e "$file" || -L "$file" ]]; then
       printf 'Recovery pending: %s\n' "$file"
     fi
@@ -1222,9 +1226,10 @@ operator_peer_available() (
 )
 
 add_profile_interactive() (
-  local role="$1" id local_ip peer ports udp subnet suggested base _last
+  local role="$1" id local_ip peer ports udp subnet suggested base _last content backup
   [[ "$role" == iran || "$role" == kharej ]] || { err 'Invalid connection role.'; return 1; }
   acquire_management_lock && profile_normal_mutation_allowed || return
+  shopt -s nullglob
   operator_add_host_policy "$role" || return
   while true; do
     id=$(operator_prompt_input 'Connection ID (lowercase, at most 10 characters)' iran1) || return
@@ -1266,9 +1271,10 @@ add_profile_interactive() (
     "$id" "$role" "$local_ip" "$peer" "$(number_ipv4 "$((base+1))")" "$(number_ipv4 "$((base+2))")" "$ports" "$udp"
   ( ROLE="$role"; profile_preflight ) || return 1
   profile_runtime_lock || return
-  write_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet" || return
+  content=$(render_profile "$id" "$role" "$local_ip" "$peer" "$ports" "$udp" "$subnet") || return
+  backup=$(install_prepare_journal add "$id" "$content") || return
+  install_apply_journal "$backup" || return
   flock -u 8; exec 8>&-
-  install_apply_script && install_profile_unit || return
   if ! systemctl enable "gre4@$id.service" || ! systemctl start "gre4@$id.service" ||
       ! systemctl is-active --quiet "gre4@$id.service"; then
     err 'Connection setup failed; configuration retained. Inspect status and retry Stop before Start.'
@@ -1543,6 +1549,9 @@ migration_restore_legacy() {
 }
 
 migrate_legacy_deployment() (
+  [[ ! -e "$MIGRATION_BACKUP_DIR/install-pending" && ! -L "$MIGRATION_BACKUP_DIR/install-pending" ]] || {
+    err 'Installation-file recovery is pending; rerun the documented installation command first.'; return 1;
+  }
   MIGRATING_LEGACY=1
   acquire_management_lock || return
   local legacy_conf="${LEGACY_CONF_FILE:-/etc/gre4.conf}" legacy_unit="${LEGACY_UNIT_FILE:-/etc/systemd/system/gre4.service}"
@@ -1763,6 +1772,354 @@ UPGRADE_V111_HELPER_SHA256="1bde86457fce770ff00c9e2c339fae9dae152ac5bd72f1385a31
 # Bash 5.1 serializes declare -f redirections and literal newlines differently.
 UPGRADE_V111_BASH51_HELPER_SHA256="d4b886236ae42f2b0a2e8f7a7ffd83f47137af3ef95ee2c49933098d2e7a28a8"
 RELEASE_STAMP_FILE="/var/lib/gre4-release"
+
+install_pending_backup() {
+  local backup
+  private_config_file "$MIGRATION_BACKUP_DIR/install-pending" || return
+  read -r backup < "$MIGRATION_BACKUP_DIR/install-pending" || return
+  [[ "$backup" == "$MIGRATION_BACKUP_DIR/"* && ${backup#"$MIGRATION_BACKUP_DIR/"} =~ ^install\.[a-zA-Z0-9]+$ ]] || return 1
+  cmp -s "$MIGRATION_BACKUP_DIR/install-pending" <(printf '%s\n' "$backup") || return 1
+  printf '%s\n' "$backup"
+}
+
+install_journal_files() {
+  local backup="$1" file id
+  printf '%s\n' format targets kind created-at intent new-helper new-unit
+  for file in helper unit release helper-absent unit-absent new-profile new-id new-release; do
+    [[ ! -e "$backup/$file" && ! -L "$backup/$file" ]] || printf '%s\n' "$file"
+  done
+  for file in "$backup"/profiles/*.conf; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    id=${file##*/}; id=${id%.conf}
+    validate_profile_id "$id" || return 1
+    printf 'profiles/%s\n' "${file##*/}"
+  done
+}
+
+install_journal_checksums() (
+  local backup="$1" files file
+  files=$(install_journal_files "$backup") || return
+  cd -- "$backup" || return
+  while read -r file; do
+    legacy_owned_file "$backup/$file" || return
+    sha256sum -- "$file" || return
+  done <<< "$files"
+)
+
+install_validate_journal() {
+  local backup="$1" file id kind stage checksums
+  [[ "$backup" == "$MIGRATION_BACKUP_DIR/"* && ${backup#"$MIGRATION_BACKUP_DIR/"} =~ ^install\.[a-zA-Z0-9]+$ ]] || return 1
+  upgrade_private_backup_directory "$MIGRATION_BACKUP_DIR" && upgrade_private_backup_directory "$backup" &&
+    upgrade_private_backup_directory "$backup/profiles" || return 1
+  for file in format targets kind created-at intent manifest.sha256 stage; do private_config_file "$backup/$file" || return; done
+  cmp -s "$backup/format" <(printf '1\n') && cmp -s "$backup/targets" <(upgrade_recovery_targets) || return 1
+  read -r kind < "$backup/kind" && [[ "$kind" == repair || "$kind" == add ]] || return 1
+  read -r stage < "$backup/stage" && [[ "$stage" == prepared || "$stage" == installing || "$stage" == complete || "$stage" == rolled-back ]] || return 1
+  cmp -s "$backup/kind" <(printf '%s\n' "$kind") && cmp -s "$backup/stage" <(printf '%s\n' "$stage") || return 1
+  upgrade_validate_intent "$backup" || return
+  for file in "$backup"/profiles/*; do
+    id=${file##*/}; id=${id%.conf}
+    [[ "$file" == *.conf ]] && validate_profile_id "$id" && read_profile_file "$file" || return 1
+  done
+  for file in new-helper new-unit; do legacy_owned_file "$backup/$file" || return; done
+  [[ -x "$backup/new-helper" ]] || return 1
+  for file in helper unit; do
+    if [[ -e "$backup/$file-absent" || -L "$backup/$file-absent" ]]; then
+      private_config_file "$backup/$file-absent" && cmp -s "$backup/$file-absent" <(printf 'absent\n') &&
+        [[ ! -e "$backup/$file" && ! -L "$backup/$file" ]] || return 1
+    else
+      legacy_owned_file "$backup/$file" && cmp -s "$backup/$file" "$backup/new-$file" || return 1
+    fi
+  done
+  if [[ "$kind" == add ]]; then
+    private_config_file "$backup/new-id" && read -r id < "$backup/new-id" && validate_profile_id "$id" || return 1
+    cmp -s "$backup/new-id" <(printf '%s\n' "$id") && [[ ! -e "$backup/profiles/$id.conf" ]] &&
+      read_profile_file "$backup/new-profile" || return 1
+  else
+    [[ ! -e "$backup/new-id" && ! -e "$backup/new-profile" && -f "$backup/unit-absent" && -f "$backup/helper" ]] || return 1
+    upgrade_verify_unmarked_pair "$backup/helper" "$backup/new-unit" || return
+  fi
+  if [[ -e "$backup/release" || -L "$backup/release" ]]; then
+    upgrade_verify_release_record "$backup/release" "$backup/new-helper" "$backup/new-unit" || return
+  fi
+  if [[ -e "$backup/new-release" || -L "$backup/new-release" ]]; then
+    upgrade_verify_release_record "$backup/new-release" "$backup/new-helper" "$backup/new-unit" || return
+  fi
+  checksums=$(install_journal_checksums "$backup") || return
+  cmp -s "$backup/manifest.sha256" <(printf '%s\n' "$checksums") || { err 'Install backup changed; preserve it for manual review.'; return 1; }
+}
+
+install_unit_intent() {
+  local id="$1" allow_active="$2" pending="$3" active enabled load fragment dropins reload paths path file link interfaces iface="g4-$1"
+  active=$(systemctl show --property=ActiveState --value "gre4@$id.service") &&
+    enabled=$(systemctl show --property=UnitFileState --value "gre4@$id.service") &&
+    load=$(systemctl show --property=LoadState --value "gre4@$id.service") &&
+    fragment=$(systemctl show --property=FragmentPath --value "gre4@$id.service") &&
+    dropins=$(systemctl show --property=DropInPaths --value "gre4@$id.service") &&
+    reload=$(systemctl show --property=NeedDaemonReload --value "gre4@$id.service") || return
+  [[ "$active" == inactive || ( "$allow_active" == yes && "$active" == active ) ]] || { err "Ambiguous active state for $id; installation was not repaired."; return 1; }
+  [[ -z "$dropins" && ( -z "$fragment" || "$fragment" == "$TEMPLATE_FILE" ) &&
+    ( "$reload" == no || ( "$pending" == yes && "$reload" == yes ) ) ]] || { err "Unit overrides or stale unit state block repair: $id"; return 1; }
+  if [[ -z "$enabled" ]]; then
+    [[ "$load" == not-found && "$active" == inactive && ! -e "$TEMPLATE_FILE" && ! -L "$TEMPLATE_FILE" ]] || return 1
+    enabled=disabled
+  fi
+  [[ "$enabled" == enabled || "$enabled" == disabled ]] || { err "Masked or customized unit blocks repair: $id"; return 1; }
+  [[ "$load" == loaded || ( "$load" == not-found && "$active" == inactive ) ]] || return 1
+  paths=$(systemctl show --property=UnitPath --value) || return
+  [[ -n "$paths" ]] || return 1
+  local -a load_paths
+  if [[ "$paths" == "${TEMPLATE_FILE%/*}" ]]; then load_paths=("$paths")
+  else read -r -a load_paths <<< "$paths"; fi
+  for path in "${load_paths[@]}"; do
+    [[ "$path" == /* ]] || return 1
+    for file in "$path/gre4@$id.service" "$path/gre4@.service"; do
+      [[ -e "$file" || -L "$file" ]] || continue
+      [[ "$file" == "$TEMPLATE_FILE" ]] || { err "Custom unit blocks install repair: $file"; return 1; }
+    done
+    for file in "$path"/service.d "$path"/gre4*.service.d; do
+      [[ ! -e "$file" && ! -L "$file" ]] || { err "Unit overrides block install repair: $file"; return 1; }
+    done
+    for link in "$path"/*.wants/"gre4@$id.service" "$path"/*.requires/"gre4@$id.service"; do
+      [[ -e "$link" || -L "$link" ]] || continue
+      [[ "$enabled" == enabled && "$link" == "${TEMPLATE_FILE%/*}/multi-user.target.wants/gre4@$id.service" &&
+        -L "$link" && $(readlink -f "$link") == "$TEMPLATE_FILE" ]] || return 1
+    done
+  done
+  if [[ "$enabled" == enabled ]]; then
+    link="${TEMPLATE_FILE%/*}/multi-user.target.wants/gre4@$id.service"
+    [[ -L "$link" && $(readlink -f "$link") == "$TEMPLATE_FILE" ]] || return 1
+  fi
+  if [[ "$active" == active ]]; then upgrade_verify_health "$id" || return
+  else
+    [[ ! -e "$STATE_DIR/profiles/$id/applied.conf" && ! -L "$STATE_DIR/profiles/$id/applied.conf" &&
+      ! -e "$STATE_DIR/profiles/$id/cleanup-pending" && ! -L "$STATE_DIR/profiles/$id/cleanup-pending" ]] || return 1
+    if [[ -f "$PROFILE_DIR/$id.conf" ]]; then load_profile "$id" || return; iface=$TUN_IF; fi
+    interfaces=$(ip -o link show) || return
+    if awk -v name="$iface" '{split($2,a,/[:@]/); if(a[1]==name) found=1} END {exit !found}' <<< "$interfaces"; then
+      err "An inactive connection still has an interface: $id"; return 1
+    fi
+  fi
+  printf '%s %s %s\n' "$id" "$active" "$enabled"
+}
+
+install_capture_intent() {
+  local new_id="${1:-}" allow_active="$2" pending="${3:-no}" file id found=0
+  for file in "$PROFILE_DIR"/*.conf; do
+    id=${file##*/}; id=${id%.conf}
+    load_profile "$id" || return
+    install_unit_intent "$id" "$allow_active" "$pending" || return
+    found=1
+  done
+  if [[ -n "$new_id" && ! -e "$PROFILE_DIR/$new_id.conf" ]]; then
+    install_unit_intent "$new_id" no "$pending" || return
+    found=1
+  fi
+  if [[ "$found" == 0 ]]; then install_unit_intent repair no "$pending" >/dev/null || return; fi
+}
+
+install_current_matches() {
+  local backup="$1" file id new_id='' count=0 expected=0 kind intent units unit extra state_entry
+  install_validate_journal "$backup" || return
+  for file in "$PROFILE_DIR" "$STATE_DIR" "$LOCK_DIR" "$MIGRATION_BACKUP_DIR" "${APPLY_SCRIPT%/*}" "${TEMPLATE_FILE%/*}" "${RELEASE_STAMP_FILE%/*}"; do
+    upgrade_safe_directory "$file" || return
+  done
+  [[ ! -e "$LEGACY_CONF_FILE" && ! -L "$LEGACY_CONF_FILE" && ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" &&
+    ! -e "$MIGRATION_BACKUP_DIR/pending" && ! -L "$MIGRATION_BACKUP_DIR/pending" &&
+    ! -e "$MIGRATION_BACKUP_DIR/upgrade-pending" && ! -L "$MIGRATION_BACKUP_DIR/upgrade-pending" ]] || return 1
+  if [[ -d "$STATE_DIR" ]]; then
+    state_entry=$(find "$STATE_DIR" -type l -print -quit) || return
+    [[ -z "$state_entry" ]] || return 1
+  fi
+  read -r kind < "$backup/kind" || return
+  if [[ -f "$backup/new-id" ]]; then read -r new_id < "$backup/new-id" || return; fi
+  for file in "$backup"/profiles/*.conf; do
+    id=${file##*/}
+    private_config_file "$PROFILE_DIR/$id" && cmp -s "$file" "$PROFILE_DIR/$id" || return 1
+    load_profile "${id%.conf}" && check_local_public_ip "$LOCAL_PUBLIC_IP" &&
+      render_profile "${id%.conf}" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$ALLOW_UDP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" >/dev/null || return 1
+    expected=$((expected+1))
+  done
+  for file in "$PROFILE_DIR"/*.conf; do
+    id=${file##*/}; id=${id%.conf}
+    if [[ "$id" == "$new_id" ]]; then
+      private_config_file "$file" && cmp -s "$file" "$backup/new-profile" || return 1
+    else count=$((count+1)); fi
+  done
+  [[ "$count" == "$expected" ]] || return 1
+  if [[ -n "$new_id" && ! -e "$PROFILE_DIR/$new_id.conf" ]]; then
+    read_profile_file "$backup/new-profile" && check_local_public_ip "$LOCAL_PUBLIC_IP" &&
+      render_profile "$new_id" "$ROLE" "$LOCAL_PUBLIC_IP" "$PEER_PUBLIC_IP" "$SERVICE_PORTS" "$ALLOW_UDP" "$(profile_subnet "$IRAN_TUN_CIDR")" "$TUN_IF" >/dev/null || return 1
+  fi
+  for file in "$STATE_DIR"/profiles/*; do
+    [[ -d "$file" ]] && upgrade_safe_directory "$file" || return 1
+    id=${file##*/}
+    [[ -f "$backup/profiles/$id.conf" || "$id" == "$new_id" ]] || return 1
+  done
+  if [[ "$kind" == repair && -d "$STATE_DIR" ]]; then
+    state_entry=$(find "$STATE_DIR" -type f -print -quit) || return
+    [[ -z "$state_entry" ]] || { err 'Runtime recovery evidence blocks missing-unit repair.'; return 1; }
+  fi
+  for file in helper unit; do
+    if [[ "$file" == helper ]]; then id="$APPLY_SCRIPT"; else id="$TEMPLATE_FILE"; fi
+    if [[ -e "$id" || -L "$id" ]]; then
+      legacy_owned_file "$id" && cmp -s "$id" "$backup/new-$file" || return 1
+      [[ "$file" != helper || -x "$id" ]] || return 1
+      if [[ -f "$backup/$file-absent" ]]; then
+        private_config_file "$backup/published-$file" &&
+          cmp -s "$backup/published-$file" <(stat -c '%d:%i:%a' "$id") || { err "A file appeared after install capture: $id"; return 1; }
+      fi
+    else [[ -f "$backup/$file-absent" ]] || return 1; fi
+  done
+  if [[ -e "$RELEASE_STAMP_FILE" || -L "$RELEASE_STAMP_FILE" ]]; then
+    private_config_file "$RELEASE_STAMP_FILE" || return
+    { { [[ -f "$backup/release" ]] && cmp -s "$RELEASE_STAMP_FILE" "$backup/release"; } ||
+      { [[ -f "$backup/new-release" ]] && cmp -s "$RELEASE_STAMP_FILE" "$backup/new-release"; }; } || return 1
+  else [[ ! -f "$backup/release" ]] || return 1; fi
+  intent=$(install_capture_intent "$new_id" "$(if [[ "$kind" == add ]]; then echo yes; else echo no; fi)" yes | LC_ALL=C sort) || return
+  cmp -s "$backup/intent" <(printf '%s\n' "$intent" | sed '/^$/d') || return 1
+  units=$(systemctl list-units --all --plain --no-legend 'gre4@*.service') || return
+  while read -r unit extra; do
+    [[ -n "$unit" ]] || continue
+    id=${unit#gre4@}; id=${id%.service}
+    [[ "$unit" == gre4@*.service ]] && validate_profile_id "$id" &&
+      { [[ -f "$backup/profiles/$id.conf" ]] || [[ "$id" == "$new_id" ]]; } || upgrade_verify_listed_unit "$unit" || return
+  done <<< "$units"
+  units=$(systemctl list-unit-files --no-legend) || return
+  while read -r unit extra; do
+    [[ "$unit" == gre4@*.service && "$unit" != gre4@.service ]] || continue
+    id=${unit#gre4@}; id=${id%.service}
+    { [[ -f "$backup/profiles/$id.conf" ]] || [[ "$id" == "$new_id" ]]; } || upgrade_verify_listed_unit "$unit" || return
+  done <<< "$units"
+}
+
+install_publish_file() {
+  local backup="$1" name="$2" source="$3" target="$4" mode="$5" staged token
+  legacy_safe_path "$target" || return
+  if [[ -e "$target" || -L "$target" ]]; then
+    legacy_owned_file "$target" && cmp -s "$target" "$source" || return 1
+    return 0
+  fi
+  staged=$(mktemp "${target%/*}/.gre4-install.XXXXXX") || return
+  if [[ -e "$backup/published-$name" || -L "$backup/published-$name" ]]; then
+    private_config_file "$backup/published-$name" || { rm -f "$staged"; return 1; }
+  fi
+  token=$(mktemp "$backup/.published.XXXXXX") || { rm -f "$staged"; return 1; }
+  if ! cp "$source" "$staged" || ! chmod "$mode" "$staged" ||
+      ! stat -c '%d:%i:%a' "$staged" > "$token" || ! chmod 600 "$token" ||
+      ! mv -f "$token" "$backup/published-$name" ||
+      ! ln "$staged" "$target"; then
+    rm -f "$staged" "$token"; return 1
+  fi
+  rm -f "$staged"
+}
+
+install_apply_journal() {
+  local backup="$1" new_id=''
+  install_current_matches "$backup" || { err "Install recovery needs manual review. Preserve $backup and read RECOVERY.txt."; return 1; }
+  [[ ! -f "$backup/new-id" ]] || read -r new_id < "$backup/new-id" || return
+  migration_set_stage "$backup" installing || return
+  if [[ -n "$new_id" ]]; then
+    private_directory "$PROFILE_DIR" || return
+    install_publish_file "$backup" profile "$backup/new-profile" "$PROFILE_DIR/$new_id.conf" 600 || return
+  fi
+  install_publish_file "$backup" helper "$backup/new-helper" "$APPLY_SCRIPT" 700 &&
+    install_publish_file "$backup" unit "$backup/new-unit" "$TEMPLATE_FILE" 644 || return 1
+  if ! systemctl daemon-reload || ! install_current_matches "$backup"; then
+    install_rollback_journal "$backup" || true
+    return 1
+  fi
+  if [[ -f "$backup/new-release" ]]; then migration_restore_file "$backup/new-release" "$RELEASE_STAMP_FILE" || return; fi
+  migration_set_stage "$backup" complete || return
+  [[ $(install_pending_backup) == "$backup" ]] || return 1
+  rm -f "$MIGRATION_BACKUP_DIR/install-pending" || return
+  log "Installation files verified; existing connections were not started or enabled. Backup: $backup"
+}
+
+install_rollback_journal() {
+  local backup="$1" name target changed=no
+  # Only files linked by this transaction, with unchanged inode/mode/bytes, may be removed.
+  for name in unit helper; do
+    [[ -f "$backup/$name-absent" && -f "$backup/published-$name" ]] || continue
+    if [[ "$name" == unit ]]; then target="$TEMPLATE_FILE"; else target="$APPLY_SCRIPT"; fi
+    [[ -e "$target" || -L "$target" ]] || continue
+    private_config_file "$backup/published-$name" && legacy_owned_file "$target" && cmp -s "$target" "$backup/new-$name" &&
+      cmp -s "$backup/published-$name" <(stat -c '%d:%i:%a' "$target") || { err "Install file changed; preserving $target and $backup"; return 1; }
+    rm -f "$target" || return
+    changed=yes
+  done
+  if [[ "$changed" == yes ]]; then systemctl daemon-reload || return; fi
+  migration_set_stage "$backup" rolled-back
+}
+
+install_prepare_journal() {
+  local kind="$1" id="${2:-}" content="${3:-}" backup file staged
+  private_directory "$MIGRATION_BACKUP_DIR" || return
+  [[ ! -e "$MIGRATION_BACKUP_DIR/install-pending" && ! -L "$MIGRATION_BACKUP_DIR/install-pending" ]] || return 1
+  backup=$(mktemp -d "$MIGRATION_BACKUP_DIR/install.XXXXXX") || return
+  chmod 700 "$backup" && mkdir "$backup/profiles" && chmod 700 "$backup/profiles" || return
+  printf '1\n' > "$backup/format" && printf '%s\n' "$kind" > "$backup/kind" &&
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$backup/created-at" && upgrade_recovery_targets > "$backup/targets" || return
+  for file in "$PROFILE_DIR"/*.conf; do cp -p "$file" "$backup/profiles/" || return; done
+  for file in helper unit; do
+    if [[ "$file" == helper ]]; then staged="$APPLY_SCRIPT"; else staged="$TEMPLATE_FILE"; fi
+    if [[ -e "$staged" || -L "$staged" ]]; then legacy_owned_file "$staged" && cp -p "$staged" "$backup/$file" || return
+    else printf 'absent\n' > "$backup/$file-absent" || return; fi
+  done
+  if [[ "$kind" == repair ]]; then
+    cp -p "$APPLY_SCRIPT" "$backup/new-helper" && render_profile_unit > "$backup/new-unit" || return
+  else
+    ( APPLY_SCRIPT="$backup/new-helper"; install_apply_script >/dev/null ) && render_profile_unit > "$backup/new-unit" || return
+    printf '%s\n' "$id" > "$backup/new-id" && printf '%s\n' "$content" > "$backup/new-profile" || return
+    if [[ -n ${GRE4_RELEASE_TAG:-} ]]; then
+      ( APPLY_SCRIPT="$backup/new-helper"; TEMPLATE_FILE="$backup/new-unit"; RELEASE_STAMP_FILE="$backup/new-release"; record_installed_release ) || return
+    fi
+  fi
+  [[ ! -e "$RELEASE_STAMP_FILE" ]] || { private_config_file "$RELEASE_STAMP_FILE" && cp -p "$RELEASE_STAMP_FILE" "$backup/release"; } || return
+  install_capture_intent "$id" "$(if [[ "$kind" == add ]]; then echo yes; else echo no; fi)" | LC_ALL=C sort > "$backup/intent" || return
+  for file in "$backup"/*; do
+    [[ -d "$file" || "$file" == "$backup/helper" || "$file" == "$backup/unit" ]] || chmod 600 "$file" || return
+  done
+  chmod 700 "$backup/new-helper" || return
+  # Existing shared artifacts must already match; Add never changes a live runtime pair.
+  for file in helper unit; do [[ ! -f "$backup/$file" ]] || cmp -s "$backup/$file" "$backup/new-$file" || return 1; done
+  cat > "$backup/RECOVERY.txt" <<'RECOVERY'
+GRE4 installation-file recovery. Preserve this directory and install-pending.
+Rerun the documented installation command to resume only a verified journal.
+No service start, enable, stop, mask, firewall or sysctl operation belongs here.
+Unknown files, changed profiles, changed service intent and other recovery markers
+require manual review. Never copy runtime snapshots over live state or edit the
+release record to bypass validation. Original missing files have *-absent markers.
+RECOVERY
+  chmod 600 "$backup/RECOVERY.txt" || return
+  migration_set_stage "$backup" prepared || return
+  install_journal_checksums "$backup" > "$backup/manifest.sha256" && chmod 600 "$backup/manifest.sha256" || return
+  install_current_matches "$backup" || return
+  staged=$(mktemp "$MIGRATION_BACKUP_DIR/.install-pending.XXXXXX") || return
+  if ! printf '%s\n' "$backup" > "$staged" || ! chmod 600 "$staged" || ! ln "$staged" "$MIGRATION_BACKUP_DIR/install-pending"; then rm -f "$staged"; return 1; fi
+  rm -f "$staged" || return
+  printf '%s\n' "$backup"
+}
+
+install_resume_or_repair() {
+  local backup digest file
+  if [[ -e "$MIGRATION_BACKUP_DIR/install-pending" || -L "$MIGRATION_BACKUP_DIR/install-pending" ]]; then
+    backup=$(install_pending_backup) || return
+    install_apply_journal "$backup"
+    return
+  fi
+  [[ ! -e "$TEMPLATE_FILE" && ! -L "$TEMPLATE_FILE" && -e "$APPLY_SCRIPT" ]] || return 0
+  legacy_owned_file "$APPLY_SCRIPT" && [[ -x "$APPLY_SCRIPT" ]] || { err "Unsafe installed helper: $APPLY_SCRIPT"; return 1; }
+  digest=$(sha256sum "$APPLY_SCRIPT") || return
+  case ${digest%% *} in "$UPGRADE_V111_HELPER_SHA256"|"$UPGRADE_V111_BASH51_HELPER_SHA256") ;; *) err "Unknown helper; missing service cannot be repaired: $TEMPLATE_FILE"; return 1 ;; esac
+  for file in "$PROFILE_DIR"/*.conf; do
+    local id=${file##*/}; id=${id%.conf}
+    load_profile "$id" || return
+  done
+  backup=$(install_prepare_journal repair) || return
+  log "Known partial installation: missing $TEMPLATE_FILE. Repair backup: $backup"
+  install_apply_journal "$backup"
+}
 
 upgrade_safe_directory() {
   local path="$1" mode
@@ -2196,7 +2553,8 @@ upgrade_validate_recovery_current() {
   for file in "$APPLY_SCRIPT" "$TEMPLATE_FILE" "$RELEASE_STAMP_FILE"; do legacy_safe_path "$file" || return; done
   [[ ! -e "$LEGACY_CONF_FILE" && ! -L "$LEGACY_CONF_FILE" &&
      ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" &&
-     ! -e "$MIGRATION_BACKUP_DIR/pending" && ! -L "$MIGRATION_BACKUP_DIR/pending" ]] || return 1
+     ! -e "$MIGRATION_BACKUP_DIR/pending" && ! -L "$MIGRATION_BACKUP_DIR/pending" &&
+     ! -e "$MIGRATION_BACKUP_DIR/install-pending" && ! -L "$MIGRATION_BACKUP_DIR/install-pending" ]] || return 1
   if [[ -d "$STATE_DIR" ]]; then
     state_entries=$(find "$STATE_DIR" -type l -print -quit) || return
     [[ -z "$state_entries" ]] || return 1
@@ -2285,9 +2643,9 @@ list_upgrade_backups() (
   [[ -e "$root" || -L "$root" ]] || { echo "No upgrade backups."; return 0; }
   upgrade_private_backup_directory "$root" || { err "Unsafe backup directory: $root"; return 1; }
   shopt -s nullglob
-  for backup in "$root"/upgrade.* "$root"/migration.*; do
+  for backup in "$root"/upgrade.* "$root"/migration.* "$root"/install.*; do
     name=${backup##*/}
-    [[ "$name" =~ ^(upgrade|migration)\.[a-zA-Z0-9]+$ ]] || continue
+    [[ "$name" =~ ^(upgrade|migration|install)\.[a-zA-Z0-9]+$ ]] || continue
     if ! upgrade_private_backup_directory "$backup"; then printf '%s unsafe manual\n' "$name"; continue; fi
     stage=unknown; from=unmarked; to=unknown; captured=unknown
     if private_config_file "$backup/stage" >/dev/null 2>&1; then
@@ -2307,13 +2665,20 @@ list_upgrade_backups() (
       fi
     done
     name=${backup##*/}
-    if [[ "$name" == upgrade.* ]] && upgrade_validate_backup "$backup" >/dev/null 2>&1; then file=guarded
+    if [[ "$name" == install.* ]] && install_validate_journal "$backup" >/dev/null 2>&1; then
+      if [[ "$stage" == complete ]]; then file='files-verified'
+      elif [[ -e "$root/install-pending" && $(install_pending_backup) == "$backup" ]]; then file='resume-default-command'
+      else file=manual; fi
+    elif [[ "$name" == upgrade.* ]] && upgrade_validate_backup "$backup" >/dev/null 2>&1; then file=guarded
     else file=manual; fi
     printf '%-22s %-20s %-12s %-12s %-20s %s\n' "$name" "$stage" "$from" "$to" "$captured" "$file"
   done
 )
 
 recover_upgrade_interactive() {
+  [[ ! -e "$MIGRATION_BACKUP_DIR/install-pending" && ! -L "$MIGRATION_BACKUP_DIR/install-pending" ]] || {
+    err 'Installation-file recovery is pending; rerun the documented installation command first.'; return 1;
+  }
   local requested="${1:-}" backup pending=no current confirmation stage kind
   if [[ -z "$requested" ]]; then
     list_upgrade_backups || return
@@ -2409,6 +2774,11 @@ automatic_upgrade() (
   local file id active enabled digest unit_digest installed_tag helper_hash unit_hash manager_hash extra backup unit units
   local backup_root="$MIGRATION_BACKUP_DIR" count=0 UPGRADE_RUNTIME_LOCKED=0 state_entries
   manager_hash=
+  if [[ ( -e "$MIGRATION_BACKUP_DIR/install-pending" || -L "$MIGRATION_BACKUP_DIR/install-pending" ) &&
+        ( -e "$LEGACY_CONF_FILE" || -L "$LEGACY_CONF_FILE" || -e "$UNIT_FILE" || -L "$UNIT_FILE" ||
+          -e "$MIGRATION_BACKUP_DIR/pending" || -L "$MIGRATION_BACKUP_DIR/pending" ) ]]; then
+    err 'Conflicting installation and migration state; preserve the backups for manual review.'; return 1
+  fi
   release_tag_valid "$GRE4_RELEASE_TAG" && [[ "$GRE4_RELEASE_SHA" =~ ^[0-9a-f]{64}$ ]] || return 1
   if [[ -e "$backup_root/upgrade-pending" || -L "$backup_root/upgrade-pending" ]]; then
     err "An interrupted upgrade needs review. Preserve $backup_root/upgrade-pending and its backup; see RECOVERY.txt there."
@@ -2429,6 +2799,7 @@ automatic_upgrade() (
     legacy_safe_path "$file" || return 1
   done
   shopt -s nullglob
+  install_resume_or_repair || return
   for file in "$PROFILE_DIR"/*.conf; do count=$((count+1)); done
   units=$(systemctl list-units --all --plain --no-legend 'gre4@*.service') || return
   while read -r unit extra; do

@@ -145,6 +145,17 @@ elif tool == 'systemctl':
     active = state.setdefault('active', {})
     if action in ('enable', 'disable'):
         enabled[unit] = action == 'enable'
+        if action == 'enable':
+            state['interfaces'].update(state.get('interfaces_on_enable', {}))
+        if profile:
+            template = Path(os.environ['GRE4_FAKE_HELPER']).parent / 'gre4@.service'
+            link = template.parent / 'multi-user.target.wants' / unit
+            if action == 'enable':
+                link.parent.mkdir(exist_ok=True)
+                if not link.is_symlink():
+                    link.symlink_to(template)
+            else:
+                link.unlink(missing_ok=True)
     dispatch = action if action in ('start', 'stop', 'restart') else (
         'start' if action == 'enable' and '--now' in args else
         'stop' if action == 'disable' and '--now' in args else '')
@@ -185,8 +196,19 @@ elif tool == 'systemctl':
         rc = 0 if enabled.get(unit, False) else 1
     elif action == 'show':
         property_name = next((part.split('=', 1)[1] for part in args if part.startswith('--property=')), '')
-        output = {'FragmentPath': os.environ['GRE4_FAKE_LEGACY_UNIT'],
-                  'DropInPaths': '', 'NeedDaemonReload': 'no'}[property_name]
+        root = Path(os.environ['GRE4_FAKE_HELPER']).parent
+        template = root / 'gre4@.service' if profile else Path(os.environ['GRE4_FAKE_LEGACY_UNIT'])
+        output = {'FragmentPath': str(template) if template.is_file() else '',
+                  'DropInPaths': '', 'NeedDaemonReload': 'no', 'UnitPath': str(root),
+                  'LoadState': 'loaded' if template.is_file() else 'not-found',
+                  'ActiveState': 'active' if active.get(unit, False) else 'inactive',
+                  'UnitFileState': ('enabled' if enabled.get(unit, False) else 'disabled') if template.is_file() else ''}[property_name]
+    elif action == 'list-units':
+        output = '\n'.join(name + ' loaded ' + ('active' if active.get(name) else 'inactive') + ' dead'
+                           for name in sorted(set(active) | set(enabled)) if name.startswith('gre4@'))
+    elif action == 'list-unit-files':
+        root = Path(os.environ['GRE4_FAKE_HELPER']).parent
+        output = 'gre4@.service disabled enabled' if (root / 'gre4@.service').is_file() else ''
     elif 'status' not in args:
         rc = 99
 elif tool == 'ufw':
@@ -274,6 +296,7 @@ LEGACY_CONF_FILE=$CONF_FILE
 UNIT_FILE=$1/gre4.service
 LEGACY_UNIT_FILE=$UNIT_FILE
 MIGRATION_BACKUP_DIR=$1/backups
+RELEASE_STAMP_FILE=$1/release
 APPLY_SCRIPT=$1/apply.sh
 ''' + body, capture_output=True, text=True, env=self.env, timeout=timeout,
         )

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 1.3.1 - 2026-11-06
+
+### Fixed
+
+- Repair a recognizable partial profile installation through the existing
+  verified-release installation command instead of rejecting every incomplete
+  runtime pair. Back up the existing evidence before creating missing files;
+  preserve profile bytes, public and tunnel addresses, ports and UDP settings.
+- Preserve inactive and boot-disabled connections during repair. Unknown or
+  modified artifacts, unsafe paths, unit overrides and ambiguous recovery state
+  still require manual review rather than automatic overwrite.
+- Make interrupted connection setup safe to revisit, with staged artifacts and
+  retained progress evidence. Retry must not overwrite a later administrator
+  change or discard a profile that was already saved.
+
+### Validation and limits
+
+- Exercise the reported official-helper/missing-template case, repeated entry,
+  interrupted setup and repair, failure cleanup and preservation of service
+  intent in regression tests and disposable Ubuntu VM acceptance.
+- Recovery remains bounded to installations whose ownership and current state
+  can be verified. Existing migration and upgrade recovery limits still apply.
+- The default installation URL remains unchanged. Publication does not deploy
+  the script or change settings on production servers.
+
+### فارسی
+
+- نصب ناقصِ قابل شناسایی با همان دستور نصب و پس از بکاپ ترمیم می‌شود؛ فایل
+  تنظیمات، آدرس‌ها، پورت‌ها و انتخاب UDP حفظ می‌شوند.
+- ترمیم، اتصال غیرفعال را شروع یا برای بوت فعال نمی‌کند. فایل سفارشی، مسیر
+  ناامن یا وضعیت بازیابی مبهم همچنان برای بررسی دستی حفظ می‌شود.
+- مراحل افزودن اتصال برای اجرای دوباره پس از قطع عملیات شواهد نگه می‌دارند؛
+  تغییر بعدی مدیر سرور با retry بازنویسی نمی‌شود.
+
 ## 1.3.0 - 2026-11-06
 
 ### Added

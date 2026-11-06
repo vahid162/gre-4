@@ -10,7 +10,7 @@ from shell_source import FUNCTIONS
 
 
 class UpgradeTests(unittest.TestCase):
-    def run_upgrade(self, body):
+    def run_upgrade(self, body, timeout=15):
         with tempfile.TemporaryDirectory(prefix='gre4-upgrade-') as root:
             result = subprocess.run(['bash', '-s', '--', root], input=FUNCTIONS + r'''
 ROOT=$1
@@ -45,14 +45,15 @@ systemctl() {
       [[ ${@: -1} != gre4@.service ]] || { echo 'missing the instance name' >&2; return 1; }
       case $2 in
         --property=UnitPath) printf '%s\n' "$ROOT" ;;
-        --property=FragmentPath) printf '%s\n' "$TEMPLATE_FILE" ;;
+        --property=LoadState) [[ -e "$TEMPLATE_FILE" ]] && echo loaded || echo not-found ;;
+        --property=FragmentPath) [[ ! -e "$TEMPLATE_FILE" ]] || printf '%s\n' "$TEMPLATE_FILE" ;;
         --property=DropInPaths) [[ ! -f $ROOT/dropin ]] || echo /custom.conf ;;
         --property=NeedDaemonReload) echo no ;;
         --property=ActiveState) [[ -f $ROOT/active/$id ]] && echo active || echo inactive ;;
         --property=UnitFileState)
           if [[ -f $ROOT/masked/$id ]]; then echo masked
           elif [[ -f $ROOT/enabled/$id ]]; then echo enabled
-          else echo disabled; fi ;;
+          elif [[ -e "$TEMPLATE_FILE" ]]; then echo disabled; fi ;;
         *) return 99 ;;
       esac ;;
     list-units) [[ ! -f $ROOT/cached-instance ]] || echo 'gre4@removed.service loaded inactive dead' ;;
@@ -124,7 +125,7 @@ HELPER
 : > "$ROOT/log"
 # Match main's conditional call: every implementation failure needs an explicit guard.
 invoke_upgrade() { automatic_upgrade "$@" || return; }
-''' + body, text=True, capture_output=True, timeout=15)
+''' + body, text=True, capture_output=True, timeout=timeout)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             return result.stdout + result.stderr
 
@@ -305,6 +306,165 @@ main --gre4-release "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA" <<<'4'
 [[ -f $ROOT/menu-opened && ! -e $APPLY_SCRIPT && ! -e $TEMPLATE_FILE ]]
 [[ ! -e $RELEASE_STAMP_FILE && ! -e $MIGRATION_BACKUP_DIR ]]
 ! grep -Eq 'systemctl (stop|start|mask)|install-helper' "$ROOT/log"
+''')
+
+    def test_default_entry_repairs_known_missing_template_without_changing_connections(self):
+        self.run_upgrade(r'''
+rm -f "$TEMPLATE_FILE" "$ROOT/active/alpha" "$ROOT/enabled/alpha" "$ROOT/enabled/gamma"
+rm -f "$ROOT/multi-user.target.wants/gre4@alpha.service" "$ROOT/multi-user.target.wants/gre4@gamma.service"
+rm -rf "$STATE_DIR/profiles"
+ip() { [[ "$*" != 'link show '* ]]; }
+install_apply_script() { cp "$ROOT/original-helper" "$APPLY_SCRIPT"; }
+need_root() { :; }
+ensure_cmd() { :; }
+release_verified_handoff() { GRE4_RELEASE_TAG=$1; GRE4_RELEASE_SHA=$2; }
+main_menu() { touch "$ROOT/menu-opened"; }
+: > "$ROOT/log"
+main --gre4-release "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA" <<<'4'
+[[ -f $ROOT/menu-opened && -f $TEMPLATE_FILE && -f $RELEASE_STAMP_FILE ]]
+cmp "$ROOT/original-unit" "$TEMPLATE_FILE"
+cmp "$ROOT/original-helper" "$APPLY_SCRIPT"
+diff -r "$ROOT/original-profiles" "$PROFILE_DIR"
+! grep -Eq 'systemctl (start|stop|enable|disable|mask|unmask)' "$ROOT/log"
+backup=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'install.*')
+[[ -n $backup && $(cat "$backup/stage") == complete && -f $backup/unit-absent ]]
+[[ ! -e $MIGRATION_BACKUP_DIR/install-pending ]]
+before=$(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'install.*' | wc -l)
+main --gre4-release "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA" <<<'4'
+[[ $(find "$MIGRATION_BACKUP_DIR" -maxdepth 1 -type d -name 'install.*' | wc -l) == "$before" ]]
+''', timeout=30)
+
+    def partial_install(self, body):
+        return self.run_upgrade(r'''
+rm -f "$TEMPLATE_FILE" "$ROOT/active/alpha" "$ROOT/enabled/alpha" "$ROOT/enabled/gamma"
+rm -f "$ROOT/multi-user.target.wants/gre4@alpha.service" "$ROOT/multi-user.target.wants/gre4@gamma.service"
+rm -rf "$STATE_DIR/profiles"
+ip() { :; }
+install_apply_script() { cp "$ROOT/original-helper" "$APPLY_SCRIPT"; }
+''' + body, timeout=30)
+
+    def test_partial_repair_refuses_unknown_or_ambiguous_state(self):
+        cases = {
+            'unknown helper': 'echo edited >> "$APPLY_SCRIPT"',
+            'nonexecutable helper': 'chmod 600 "$APPLY_SCRIPT"',
+            'writable helper': 'chmod 722 "$APPLY_SCRIPT"',
+            'invalid profile': 'echo UNEXPECTED=value >> "$PROFILE_DIR/alpha.conf"',
+            'active instance': 'touch "$ROOT/active/alpha"',
+            'masked instance': 'touch "$ROOT/masked/alpha"',
+            'drop-in': 'touch "$ROOT/dropin"',
+            'global override': 'mkdir "$ROOT/service.d"',
+            'instance override': 'echo custom > "$ROOT/gre4@alpha.service"',
+            'upgrade pending': 'mkdir "$MIGRATION_BACKUP_DIR"; touch "$MIGRATION_BACKUP_DIR/upgrade-pending"',
+            'legacy pending': 'mkdir "$MIGRATION_BACKUP_DIR"; touch "$MIGRATION_BACKUP_DIR/pending"',
+            'runtime evidence': 'mkdir -p "$STATE_DIR/profiles/alpha"; cp "$PROFILE_DIR/alpha.conf" "$STATE_DIR/profiles/alpha/applied.conf"',
+            'orphan state': 'mkdir -p "$STATE_DIR/profiles/unknown"',
+            'changed release': 'printf unexpected > "$RELEASE_STAMP_FILE"; chmod 600 "$RELEASE_STAMP_FILE"',
+            'IP inspection failure': 'ip() { return 71; }',
+            'legacy interface': 'mv "$PROFILE_DIR/alpha.conf" "$PROFILE_DIR/legacy.conf"; sed -i s/g4-alpha/GRE/ "$PROFILE_DIR/legacy.conf"; ip() { [[ $* != "-o link show" ]] || echo "1: GRE: <UP> mtu 1420"; }',
+        }
+        for label, setup in cases.items():
+            with self.subTest(condition=label):
+                self.partial_install(setup + r'''
+before=$(sha256sum "$APPLY_SCRIPT")
+: > "$ROOT/log"
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+[[ ! -e $TEMPLATE_FILE && ! -L $TEMPLATE_FILE ]]
+[[ $(sha256sum "$APPLY_SCRIPT") == "$before" ]]
+! grep -Eq 'systemctl (start|stop|enable|disable|mask|unmask)' "$ROOT/log"
+''')
+
+    def test_partial_repair_reload_failure_rolls_back_only_owned_unit_and_retries(self):
+        self.partial_install(r'''
+eval "$(declare -f systemctl | sed '1s/systemctl/original_systemctl/')"
+systemctl() {
+  [[ $1 != daemon-reload || ! -f $ROOT/fail-reload ]] || return 72
+  original_systemctl "$@"
+}
+touch "$ROOT/fail-reload"
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+[[ ! -e $TEMPLATE_FILE && -e $MIGRATION_BACKUP_DIR/install-pending ]]
+backup=$(cat "$MIGRATION_BACKUP_DIR/install-pending")
+cmp "$APPLY_SCRIPT" "$backup/helper"
+diff -r "$PROFILE_DIR" "$backup/profiles"
+rm "$ROOT/fail-reload"
+invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+[[ -f $TEMPLATE_FILE && ! -e $MIGRATION_BACKUP_DIR/install-pending && $(cat "$backup/stage") == complete ]]
+''')
+
+    def test_partial_repair_preserves_concurrent_new_or_changed_unit(self):
+        for point in ('publish', 'reload'):
+            with self.subTest(point=point):
+                self.partial_install('POINT=' + point + r'''
+eval "$(declare -f install_publish_file | sed '1s/install_publish_file/original_publish/')"
+install_publish_file() {
+  if [[ $POINT == publish && $2 == unit ]]; then printf 'administrator unit\n' > "$4"; fi
+  original_publish "$@"
+}
+eval "$(declare -f systemctl | sed '1s/systemctl/original_systemctl/')"
+systemctl() {
+  if [[ $POINT == reload && $1 == daemon-reload ]]; then printf 'administrator unit\n' > "$TEMPLATE_FILE"; return 73; fi
+  original_systemctl "$@"
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+grep -Fxq 'administrator unit' "$TEMPLATE_FILE"
+[[ -f $MIGRATION_BACKUP_DIR/install-pending && ! -e $RELEASE_STAMP_FILE ]]
+cmp "$APPLY_SCRIPT" "$ROOT/original-helper"
+''')
+
+    def test_interrupted_partial_repair_resumes_without_service_changes(self):
+        self.partial_install(r'''
+eval "$(declare -f migration_set_stage | sed '1s/migration_set_stage/original_set_stage/')"
+migration_set_stage() {
+  original_set_stage "$@" || return
+  if [[ $2 == installing && ! -f $ROOT/interrupted ]]; then touch "$ROOT/interrupted"; kill -KILL "$BASHPID"; fi
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+[[ -e $MIGRATION_BACKUP_DIR/install-pending && ! -e $TEMPLATE_FILE ]]
+: > "$ROOT/log"
+invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+[[ -f $TEMPLATE_FILE && ! -e $MIGRATION_BACKUP_DIR/install-pending ]]
+! grep -Eq 'systemctl (start|stop|enable|disable|mask|unmask)' "$ROOT/log"
+''')
+
+    def test_repair_interrupted_after_owned_unit_publication_reloads_and_resumes(self):
+        self.partial_install(r'''
+eval "$(declare -f install_publish_file | sed '1s/install_publish_file/original_publish/')"
+install_publish_file() {
+  original_publish "$@" || return
+  if [[ $2 == unit && ! -f $ROOT/interrupted ]]; then touch "$ROOT/interrupted"; kill -KILL "$BASHPID"; fi
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+backup=$(cat "$MIGRATION_BACKUP_DIR/install-pending")
+[[ -f $TEMPLATE_FILE && -f $backup/published-unit && $(cat "$backup/stage") == installing ]]
+: > "$ROOT/log"
+invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"
+[[ ! -e $MIGRATION_BACKUP_DIR/install-pending && $(cat "$backup/stage") == complete ]]
+grep -Fxq 'systemctl daemon-reload' "$ROOT/log"
+! grep -Eq 'systemctl (start|stop|enable|disable|mask|unmask)' "$ROOT/log"
+''')
+
+    def test_install_journal_changed_profile_or_manifest_is_preserved_for_manual_review(self):
+        for changed in ('profile', 'manifest', 'intent'):
+            with self.subTest(changed=changed):
+                self.partial_install('CHANGED=' + changed + r'''
+eval "$(declare -f migration_set_stage | sed '1s/migration_set_stage/original_set_stage/')"
+migration_set_stage() {
+  original_set_stage "$@" || return
+  if [[ $2 == installing && ! -f $ROOT/interrupted ]]; then touch "$ROOT/interrupted"; kill -KILL "$BASHPID"; fi
+}
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+backup=$(cat "$MIGRATION_BACKUP_DIR/install-pending")
+case "$CHANGED" in
+  profile) echo '# administrator edit' >> "$PROFILE_DIR/alpha.conf" ;;
+  manifest) echo edited >> "$backup/manifest.sha256" ;;
+  intent) touch "$ROOT/enabled/alpha" ;;
+esac
+before=$(sha256sum "$PROFILE_DIR/alpha.conf" "$backup/manifest.sha256")
+: > "$ROOT/log"
+if invoke_upgrade "$GRE4_RELEASE_TAG" "$GRE4_RELEASE_SHA"; then exit 70; fi
+[[ ! -e $TEMPLATE_FILE && -e $MIGRATION_BACKUP_DIR/install-pending ]]
+[[ $(sha256sum "$PROFILE_DIR/alpha.conf" "$backup/manifest.sha256") == "$before" ]]
+! grep -Eq 'systemctl (start|stop|enable|disable|mask|unmask|daemon-reload)' "$ROOT/log"
 ''')
 
     def test_unit_file_discovery_failure_remains_fatal(self):

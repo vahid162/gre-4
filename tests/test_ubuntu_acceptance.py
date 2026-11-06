@@ -25,6 +25,50 @@ guest = load('guest_acceptance')
 
 
 class UbuntuAcceptanceSafetyTests(unittest.TestCase):
+    def test_partial_install_action_refuses_unmarked_machine_before_commands(self):
+        with patch.object(guest.os, 'geteuid', return_value=0), \
+                patch.object(guest, 'MARKER') as marker, \
+                patch.object(guest, 'run') as run, \
+                patch('sys.argv', ['guest_acceptance.py', 'repair-partial', '--role', 'iran1']), \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            marker.is_file.return_value = False
+            with self.assertRaises(SystemExit) as result:
+                guest.main()
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn('Refusing to run outside', error.getvalue())
+            run.assert_not_called()
+
+    def test_partial_install_phase_detects_an_unexpected_old_peer_change(self):
+        for changed_peer in (None, 'kharej', 'iran2'):
+            with self.subTest(changed_peer=changed_peer):
+                guests = []
+                events = []
+                for role in ['kharej', 'iran1', 'iran2']:
+                    vm = Mock(role=role)
+                    vm.check.side_effect = lambda *args, role=role: events.append((role, args))
+                    reads = [0]
+
+                    def ssh(*args, role=role, reads=reads, **kwargs):
+                        if args[:2] == ('sudo', 'sha256sum'):
+                            reads[0] += 1
+                            changed = changed_peer == role and reads[0] > 1
+                            return subprocess.CompletedProcess(args, 0, role + ('-changed' if changed else '-old'), '')
+                        return subprocess.CompletedProcess(args, 0, '', '')
+
+                    vm.ssh.side_effect = ssh
+                    guests.append(vm)
+                record = {'passed': []}
+                if changed_peer is None:
+                    runner.partial_install_acceptance(guests, record)
+                    self.assertIn(('iran1', ('repair-partial',)), events)
+                    self.assertEqual([role for role, args in events if args == ('clean',)],
+                                     ['kharej', 'iran1', 'iran2'])
+                    self.assertTrue(any('partial install' in item for item in record['passed']))
+                else:
+                    with self.assertRaises(AssertionError):
+                        runner.partial_install_acceptance(guests, record)
+                    self.assertFalse(record['passed'])
+
     def test_release_command_forwards_operator_arguments_after_verified_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
