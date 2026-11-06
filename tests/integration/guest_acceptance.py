@@ -56,6 +56,7 @@ def menu(role, profile, local, peer, subnet, udp='yes', success=True):
     result = run(*command, input='\n'.join(
         [choice, profile, local, peer, PORT, udp, subnet, '']), check=False)
     assert (result.returncode == 0) == success, result.stdout + result.stderr
+    return result
 
 
 def unit(profile, action, check=True):
@@ -192,19 +193,26 @@ def collision():
     applied = Path('/var/lib/gre4/profiles/collision/applied.conf')
     inspect = ('ip', '-j', '-d', 'link', 'show', 'dev', 'g4-collision')
     run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
-    foreign = run(*inspect).stdout
-    menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30', success=False)
+    run('udevadm', 'settle', '--timeout=30')
+    foreign = json.loads(run(*inspect).stdout)
+    refused = menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30', success=False)
+    output = refused.stdout + refused.stderr
+    assert 'An inactive connection still has an interface: collision' in output, output
     assert not profile.exists() and not applied.exists()
-    assert run(*inspect).stdout == foreign
+    current = json.loads(run(*inspect).stdout)
+    assert current == foreign, json.dumps({'before': foreign, 'after': current})
     traffic()
     run('ip', 'link', 'delete', 'g4-collision')
     menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30')
     unit('collision', 'stop')
     # Keep the runtime ownership check covered after Add's earlier refusal.
     run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
-    foreign = run(*inspect).stdout
+    run('udevadm', 'settle', '--timeout=30')
+    foreign = json.loads(run(*inspect).stdout)
     assert unit('collision', 'start', check=False).returncode != 0
-    assert not applied.exists() and run(*inspect).stdout == foreign
+    assert not applied.exists()
+    current = json.loads(run(*inspect).stdout)
+    assert current == foreign, json.dumps({'before': foreign, 'after': current})
     traffic()
     run('ip', 'link', 'delete', 'g4-collision')
     run('systemctl', 'reset-failed', 'gre4@collision.service')

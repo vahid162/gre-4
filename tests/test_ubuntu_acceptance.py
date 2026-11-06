@@ -27,22 +27,48 @@ guest = load('guest_acceptance')
 
 class UbuntuAcceptanceSafetyTests(unittest.TestCase):
     def test_collision_retries_add_before_starting_a_preflight_rejected_profile(self):
-        state = {'interface': None, 'profile': False, 'applied': False}
+        self.check_collision()
+
+    def test_collision_rejects_changed_link_identity_or_kind(self):
+        for inspection in (2, 4):
+            for changed in ({'ifindex': 78, 'linkinfo': {'info_kind': 'dummy'}},
+                            {'ifindex': 77, 'linkinfo': {'info_kind': 'gre'}}):
+                with self.subTest(inspection=inspection, changed=changed):
+                    with self.assertRaises(AssertionError) as result:
+                        self.check_collision((inspection, changed))
+                    snapshots = json.loads(str(result.exception))
+                    self.assertEqual(snapshots['before'], [
+                        {'ifindex': 77, 'linkinfo': {'info_kind': 'dummy'}}])
+                    self.assertEqual(snapshots['after'], [changed])
+
+    def check_collision(self, changed_snapshot=None):
+        state = {'interface': None, 'profile': False, 'applied': False, 'inspections': 0, 'settled': False}
 
         def command(*args, **kwargs):
             if args[:3] == ('ip', 'link', 'add'):
                 self.assertIsNone(state['interface'])
-                state['interface'] = {'ifindex': 77, 'linkinfo': {'info_kind': 'dummy'}}
+                state['interface'] = {'linkinfo': {'info_kind': 'dummy'}, 'ifindex': 77}
+                state['settled'] = False
+            elif args[:2] == ('udevadm', 'settle'):
+                state['settled'] = True
             elif args[:3] == ('ip', 'link', 'delete'):
                 state['interface'] = None
             elif args[0] == 'ip':
                 self.assertIsNotNone(state['interface'])
-            return subprocess.CompletedProcess(args, 0, json.dumps([state['interface']]), '')
+                self.assertTrue(state['settled'], 'Settle each dummy before its baseline inspection')
+                state['inspections'] += 1
+                if changed_snapshot and state['inspections'] == changed_snapshot[0]:
+                    state['interface'] = changed_snapshot[1]
+            return subprocess.CompletedProcess(args, 0, json.dumps(
+                [state['interface']], sort_keys=state['inspections'] % 2 == 0,
+                indent=2 if state['inspections'] % 2 else None), '')
 
         def add(*args, success=True, **kwargs):
             self.assertEqual(success, state['interface'] is None)
             if success:
                 state.update(profile=True, applied=True, interface={'kind': 'gre'})
+            return subprocess.CompletedProcess([], 0 if success else 1,
+                '' if success else 'An inactive connection still has an interface: collision', '')
 
         def service(profile, action, check=True):
             self.assertTrue(state['profile'], 'Start must not assume failed Add saved a profile')
