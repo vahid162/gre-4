@@ -188,12 +188,26 @@ def traffic(peer='both'):
 
 
 def collision():
+    profile = Path('/etc/gre4/profiles/collision.conf')
+    applied = Path('/var/lib/gre4/profiles/collision/applied.conf')
+    inspect = ('ip', '-j', '-d', 'link', 'show', 'dev', 'g4-collision')
     run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
+    foreign = run(*inspect).stdout
     menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30', success=False)
-    run('ip', 'link', 'show', 'dev', 'g4-collision')
-    assert not Path('/var/lib/gre4/profiles/collision/applied.conf').exists()
+    assert not profile.exists() and not applied.exists()
+    assert run(*inspect).stdout == foreign
     traffic()
     run('ip', 'link', 'delete', 'g4-collision')
+    menu('kharej', 'collision', ENDPOINTS['kharej'], '203.0.113.2', '172.16.1.8/30')
+    unit('collision', 'stop')
+    # Keep the runtime ownership check covered after Add's earlier refusal.
+    run('ip', 'link', 'add', 'name', 'g4-collision', 'type', 'dummy')
+    foreign = run(*inspect).stdout
+    assert unit('collision', 'start', check=False).returncode != 0
+    assert not applied.exists() and run(*inspect).stdout == foreign
+    traffic()
+    run('ip', 'link', 'delete', 'g4-collision')
+    run('systemctl', 'reset-failed', 'gre4@collision.service')
     unit('collision', 'start')
     manager('profile_remove collision\n')
     traffic()

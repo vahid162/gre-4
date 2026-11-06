@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,6 +26,53 @@ guest = load('guest_acceptance')
 
 
 class UbuntuAcceptanceSafetyTests(unittest.TestCase):
+    def test_collision_retries_add_before_starting_a_preflight_rejected_profile(self):
+        state = {'interface': None, 'profile': False, 'applied': False}
+
+        def command(*args, **kwargs):
+            if args[:3] == ('ip', 'link', 'add'):
+                self.assertIsNone(state['interface'])
+                state['interface'] = {'ifindex': 77, 'linkinfo': {'info_kind': 'dummy'}}
+            elif args[:3] == ('ip', 'link', 'delete'):
+                state['interface'] = None
+            elif args[0] == 'ip':
+                self.assertIsNotNone(state['interface'])
+            return subprocess.CompletedProcess(args, 0, json.dumps([state['interface']]), '')
+
+        def add(*args, success=True, **kwargs):
+            self.assertEqual(success, state['interface'] is None)
+            if success:
+                state.update(profile=True, applied=True, interface={'kind': 'gre'})
+
+        def service(profile, action, check=True):
+            self.assertTrue(state['profile'], 'Start must not assume failed Add saved a profile')
+            if action == 'stop':
+                state.update(applied=False, interface=None)
+                return subprocess.CompletedProcess([], 0)
+            if state['interface'] is not None:
+                self.assertFalse(check)
+                return subprocess.CompletedProcess([], 1)
+            state.update(applied=True, interface={'kind': 'gre'})
+            return subprocess.CompletedProcess([], 0)
+
+        def path(value):
+            kind = 'profile' if value.startswith('/etc/') else 'applied'
+            return Mock(exists=lambda: state[kind])
+
+        with patch.object(guest, 'run', side_effect=command), \
+                patch.object(guest, 'menu', side_effect=add) as menu, \
+                patch.object(guest, 'unit', side_effect=service) as unit, \
+                patch.object(guest, 'Path', side_effect=path), \
+                patch.object(guest, 'manager') as manager, \
+                patch.object(guest, 'traffic') as traffic:
+            guest.collision()
+        self.assertEqual([call.kwargs.get('success', True) for call in menu.call_args_list], [False, True])
+        self.assertIn((('collision', 'start'), {'check': False}),
+                      [(call.args, call.kwargs) for call in unit.call_args_list])
+        self.assertEqual(unit.call_args.args, ('collision', 'start'))
+        manager.assert_called_once_with('profile_remove collision\n')
+        self.assertGreaterEqual(traffic.call_count, 3)
+
     def test_partial_install_action_refuses_unmarked_machine_before_commands(self):
         with patch.object(guest.os, 'geteuid', return_value=0), \
                 patch.object(guest, 'MARKER') as marker, \
